@@ -74,8 +74,8 @@ I didn't just add sections - I created a **command center**:
 ### **Method 1: Run as Python Script** (Recommended for Developers)
 ```bash
 # Clone or download the project
-git clone [your-repo-url] youtube-downloader
-cd youtube-downloader
+git clone https://github.com/H190K/yt-downloader.git
+cd yt-downloader
 
 # Install dependencies
 pip install -r requirements.txt
@@ -85,18 +85,9 @@ python app_threaded.py
 ```
 
 ### **Method 2: Standalone Executable** (Preferred for End Users)
-1. **Download**: Grab `YouTubeDownloader.exe` from releases
-2. **Run**: Double-click to launch (no installation needed!)
-3. **Enjoy** Windows, macOS, or Linux - I've got you covered
-
-### **Method 3: Build Your Own**
-```bash
-# Create your own executable
-python build_exe.py
-
-# Find your fresh-built app in dist/ folder
-# Ready to share with friends! 🎁
-```
+1. **Download**: Grab `YouTubeDownloaderSetup.exe` from the releases section.
+2. **Install**: Run the installer and follow the on-screen wizard.
+3. **Enjoy**: Launch the application from your desktop or start menu.
 
 ---
 
@@ -116,7 +107,7 @@ python build_exe.py
 ### **For Development**
 ```bash
 # 1. Clone
-https://github.com/h190k/youtube-downloader-pro.git
+git clone https://github.com/H190K/yt-downloader.git
 
 # 2. Dependencies
 pip install customtkinter yt-dlp Pillow requests pyinstaller
@@ -131,27 +122,25 @@ python app_threaded.py
 ```
 
 ### **For End Users**
-1. **Download** the latest release
-2. **Extract** anywhere on your system  
-3. **Launch** YouTubeDownloader.exe
-4. **Start downloading** instantly!
+1. **Download** the latest release.
+2. **Run** `YouTubeDownloaderSetup.exe` and follow the installation wizard.
+3. **Launch** the application and start downloading instantly!
 
 ---
 
 ## 🗂️ **File Structure Explained**
 
 ```
-youtube-downloader/
-├── 🐍 app_threaded.py          # Main application - 1200+ lines of pure magic
-├── 🔧 build_exe.py            # PyInstaller build script
+yt-downloader/
+├── 🐍 app_threaded.py          # Main application
 ├── 📋 requirements.txt        # Python dependencies list
-├── 🎨 icon.ico                # Windows/Mac app icon
-├── 🎬 ffmpeg/                 # Ultra-fast media processing
+├── 🎨 icon.ico                # Application icon
+├── 🎬 ffmpeg/                 # For media processing
 │   ├── 📁 bin/                # Binary executables
 │   ├── 📚 doc/                # FFmpeg documentation
-│   └── 🔧 include/            # Development headers
+│   ├── 🔧 include/            # Development headers
+│   └── 📦 lib/                # FFmpeg libraries
 ├── 📖 README.md               # You're reading it! 😊
-└── 🎗️ LICENSE                # Open source happiness
 ```
 
 ---
