@@ -219,7 +219,7 @@ class DownloadWorker:
             
             # Set ffmpeg path (local first, then system PATH)
             ffmpeg_paths = [
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg", "bin", "ffmpeg.exe"),  # Local ffmpeg
+                resource_path(os.path.join("ffmpeg", "bin", "ffmpeg.exe")),  # Local ffmpeg (PyInstaller compatible)
                 "ffmpeg"  # System PATH
             ]
             
@@ -686,12 +686,14 @@ class YouTubeDownloaderApp(customtkinter.CTk):
 
     def check_dependencies(self):
         """Check for required dependencies"""
-        # Check for yt-dlp
+        # Check for yt-dlp (as Python module)
         try:
-            subprocess.run(["yt-dlp", "--version"], check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            import yt_dlp
+            # Test if yt-dlp module works by getting version
+            version = yt_dlp.version.__version__
             self.status_label.configure(text="yt-dlp found.", text_color="green")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            self.status_label.configure(text="Error: yt-dlp not found. Please install it (e.g., pip install yt-dlp).", text_color="red")
+        except (ImportError, AttributeError) as e:
+            self.status_label.configure(text="Error: yt-dlp module not found. Please install it (e.g., pip install yt-dlp).", text_color="red")
             self.fetch_button.configure(state="disabled")
             self.download_button.configure(state="disabled")
             return
@@ -699,7 +701,7 @@ class YouTubeDownloaderApp(customtkinter.CTk):
         # Check for ffmpeg (local first, then system PATH)
         ffmpeg_found = False
         ffmpeg_paths = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg", "bin", "ffmpeg.exe"),  # Local ffmpeg
+            resource_path(os.path.join("ffmpeg", "bin", "ffmpeg.exe")),  # Local ffmpeg (PyInstaller compatible)
             "ffmpeg"  # System PATH
         ]
         

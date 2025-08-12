@@ -184,6 +184,7 @@ yt-downloader/
 
 | **Problem** | **Solution** |
 |-------------|--------------|
+| *"yt-dlp not found"* | Install yt-dlp: `pip install yt-dlp` (Python module required, not CLI) |
 | *"ffmpeg not found"* | Windows: Use bundled ffmpeg/macOS: `brew install ffmpeg/Linux: `sudo apt install ffmpeg` |
 | *"Download failed"* | Check internet, try different format |
 | *"GUI doesn't start"* | Verify Python 3.7+ and dependencies installed |
