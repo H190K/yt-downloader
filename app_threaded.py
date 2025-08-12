@@ -1,6 +1,7 @@
 import customtkinter
 import yt_dlp
 import os
+import sys
 import threading
 import subprocess
 from PIL import Image, ImageTk
@@ -13,6 +14,14 @@ import queue
 import time
 import uuid
 import json
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 class DownloadWorker:
     """Background worker for handling downloads"""
@@ -307,8 +316,7 @@ class YouTubeDownloaderApp(customtkinter.CTk):
         
         # Set application icon
         try:
-            if os.path.exists("icon.ico"):
-                self.iconbitmap("icon.ico")
+            self.iconbitmap(resource_path("icon.ico"))
         except Exception:
             pass  # Ignore if icon can't be loaded
         
