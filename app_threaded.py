@@ -436,7 +436,7 @@ class YouTubeDownloaderApp(customtkinter.CTk):
         self.appearance_mode_label.grid(row=5, column=0, padx=15, pady=(10, 0))
         
         # Theme options with better colored icons
-        theme_options = ["🟡 Light", "🔵 Dark"]
+        theme_options = ["☀️ Light", "🌜 Dark"]
         self.appearance_mode_optionemenu = customtkinter.CTkOptionMenu(
             self.sidebar_frame, 
             values=theme_options,
@@ -447,7 +447,7 @@ class YouTubeDownloaderApp(customtkinter.CTk):
             button_hover_color="#CCCCCC"
         )
         self.appearance_mode_optionemenu.grid(row=6, column=0, padx=15, pady=(5, 15))
-        self.appearance_mode_optionemenu.set("🔵 Dark")
+        self.appearance_mode_optionemenu.set("🌜 Dark")
 
         # Download Guide Section
         self.guide_label = customtkinter.CTkLabel(self.sidebar_frame, text="📥 Download Guide", font=customtkinter.CTkFont(size=16, weight="bold"))
