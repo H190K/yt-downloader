@@ -7,7 +7,7 @@
 
 **Transform your YouTube videos into your personal media library with style!** 🚀
 
-> **Note:** This is **NOT** your basic YouTube downloader. We've taken the concept and completely revolutionized it with a stunning interface, intelligent features, and developer-grade functionality. Ready to experience downloading like never before?
+> **Note:** This is **NOT** your basic YouTube downloader. I took the concept and completely revolutionized it with a stunning interface, intelligent features, and developer-grade functionality. Ready to experience downloading like never before?
 
 ---
 
@@ -20,7 +20,7 @@
 - **📱 Responsive Layout**: 800x700 window that adapts beautifully to content
 
 ### 💎 **Sidebar Redesign - Information Palace**
-We didn't just add sections - we created a **command center**:
+I didn't just add sections - I created a **command center**:
 
 | 📥 **Download Guide** | Your personal video downloading tutorial |
 |---------------------|----------------------------------------|
@@ -35,7 +35,7 @@ We didn't just add sections - we created a **command center**:
 | M4A               | Premium audio keeping original codec quality 🔊 |
 | MP3               | Universal audio - plays anywhere 📱 |
 
-| ⚡ **Features Showcase** | What makes us special |
+| ⚡ **Features Showcase** | What makes this special |
 |------------------------|---------------------|
 | 🎯 **Smart Defaults** | Auto-saves to your system's Downloads folder |
 | ☑️ **Zero Date Madness** | Clean filenames without timestamp clutter |
@@ -87,7 +87,7 @@ python app_threaded.py
 ### **Method 2: Standalone Executable** (Preferred for End Users)
 1. **Download**: Grab `YouTubeDownloader.exe` from releases
 2. **Run**: Double-click to launch (no installation needed!)
-3. **Enjoy** Windows, macOS, or Linux - we've got you covered
+3. **Enjoy** Windows, macOS, or Linux - I've got you covered
 
 ### **Method 3: Build Your Own**
 ```bash
