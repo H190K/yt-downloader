@@ -1,7 +1,10 @@
 """Design tokens (colors, fonts, icons) and small widget factories.
 
 Every color is a ``(light, dark)`` tuple so customtkinter re-colors widgets automatically when
-the appearance mode changes; no manual recoloring is needed anywhere in the UI.
+the appearance mode changes; no manual recoloring is needed anywhere in the UI. Never pass a
+single hex string as a widget color: it would keep that color in both themes. Switching themes
+goes through ``App.apply_theme`` (cross-fade, see :mod:`ui.transition`), never
+``ctk.set_appearance_mode`` directly.
 """
 from __future__ import annotations
 
@@ -37,6 +40,7 @@ ACCENT_HOVER: Color = ("#4338CA", "#5A51E6")
 ACCENT_SOFT: Color = ("#EEEDFE", "#24234A")
 ACCENT_TEXT: Color = ("#4338CA", "#A7A2FF")
 ON_ACCENT: Color = ("#FFFFFF", "#FFFFFF")
+ON_ACCENT_DISABLED: Color = ("#C9C6F7", "#8C88C9")
 
 SUCCESS: Color = ("#15803D", "#34D399")
 SUCCESS_SOFT: Color = ("#DCFCE7", "#11342A")
@@ -49,6 +53,11 @@ DANGER_HOVER: Color = ("#FCD9D9", "#4A1C20")
 TRACK: Color = ("#E4E7EF", "#262B3B")
 SCROLL: Color = ("#D3D7E1", "#2A3042")
 SCROLL_HOVER: Color = ("#BCC2CF", "#39405A")
+
+SEGMENT_SELECTED: Color = ("#FFFFFF", "#3A4060")
+SEGMENT_SELECTED_HOVER: Color = ("#FFFFFF", "#434A6E")
+KNOB: Color = ("#FFFFFF", "#E9EBF3")
+KNOB_HOVER: Color = ("#F4F4F8", "#FFFFFF")
 
 # --------------------------------------------------------------------------- fonts
 FAMILY = "Segoe UI"
@@ -182,7 +191,7 @@ def accent_button(master: Any, text: str, command: Callable[[], Any] | None = No
     return ctk.CTkButton(
         master, text=text, command=command, height=height, width=width, corner_radius=8,
         fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
-        text_color_disabled=("#C9C6F7", "#8C88C9"), font=font(size, "semibold"),
+        text_color_disabled=ON_ACCENT_DISABLED, font=font(size, "semibold"),
         image=icon_image(icon, 16, ON_ACCENT) if icon else None, compound="left", **kw)
 
 
@@ -224,8 +233,8 @@ def segmented(master: Any, values: list[str], command: Callable[[str], Any] | No
     """Pill-style segmented control (selected segment is a raised light surface)."""
     return ctk.CTkSegmentedButton(
         master, values=values, command=command, height=34, corner_radius=8, border_width=3,
-        fg_color=CONTROL, selected_color=("#FFFFFF", "#3A4060"),
-        selected_hover_color=("#FFFFFF", "#434A6E"), unselected_color=CONTROL,
+        fg_color=CONTROL, selected_color=SEGMENT_SELECTED,
+        selected_hover_color=SEGMENT_SELECTED_HOVER, unselected_color=CONTROL,
         unselected_hover_color=CONTROL_HOVER, text_color=TEXT, text_color_disabled=TEXT_3,
         font=font(12, "semibold"), **kw)
 
@@ -234,8 +243,8 @@ def switch(master: Any, text: str = "", command: Callable[[], Any] | None = None
            **kw: Any) -> ctk.CTkSwitch:
     return ctk.CTkSwitch(
         master, text=text, command=command, font=font(13), text_color=TEXT,
-        progress_color=ACCENT, button_color=("#FFFFFF", "#E9EBF3"),
-        button_hover_color=("#F4F4F8", "#FFFFFF"), fg_color=SCROLL, switch_width=40,
+        progress_color=ACCENT, button_color=KNOB, button_hover_color=KNOB_HOVER,
+        fg_color=SCROLL, switch_width=40,
         switch_height=20, **kw)
 
 

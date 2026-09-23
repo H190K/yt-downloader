@@ -16,6 +16,8 @@ from ui import APP_NAME, AUTHOR, GITHUB_PROFILE_URL, WEBSITE_URL
 from ui import theme as T
 from ui.backend import (FAKE_BACKEND, DependencyManager, ensure_dirs, load_config, resource_path,
                         save_config)
+from ui.transition import (SYSTEM_POLL_MS, ThemeTransition, apply_appearance, paint_now,
+                           resolve_mode, set_cloaked, set_title_bar_dark)
 from ui.util import friendly_error
 from ui.widgets import Dot, LinkLabel, NavItem, SlidingIndicator, Toast, bind_tree, set_cursor
 
@@ -34,11 +36,21 @@ NAV = (
 
 
 class App(ctk.CTk):
+    # customtkinter recolors the title bar by withdrawing and re-showing the whole window on every
+    # appearance change (a visible blink); we set the DWM attribute directly instead.
+    _deactivate_windows_window_header_manipulation = True
+
     def __init__(self) -> None:
         self.cfg: dict[str, Any] = load_config()
-        ctk.set_appearance_mode(self.cfg.get("theme", "dark"))
+        # Resolve "system" ourselves and always hand customtkinter an explicit mode: its own
+        # system-follow loop would recolor the window without our cross-fade.
+        mode = resolve_mode(self.cfg.get("theme"))
+        ctk.set_appearance_mode(mode)
         super().__init__(fg_color=T.BG)
         self.withdraw()  # build hidden (no white flash / half-drawn layout), reveal when ready
+        self.theme_fx = ThemeTransition(self, self._apply_mode)
+        self.theme_fx.mode = mode
+        set_title_bar_dark(self, mode == "dark")  # before the window is ever shown
         self.title(APP_NAME)
         self._set_icon()
         self._place_window(1040, 700)
@@ -65,6 +77,7 @@ class App(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._drain_job: str | None = self.after(POLL_MS, self._drain)
+        self._theme_job: str | None = self.after(SYSTEM_POLL_MS, self._watch_system_theme)
 
         try:
             ready = self.deps.is_ready()
@@ -79,8 +92,22 @@ class App(ctk.CTk):
 
     def _reveal(self) -> None:
         self.update_idletasks()
+        set_title_bar_dark(self, self.theme_fx.mode == "dark")
+        # Map the window while it is cloaked, let Tk paint it completely, then uncloak: otherwise
+        # Windows shows the unpainted (white) client area for a few hundred ms on startup.
+        cloaked = set_cloaked(self, True)
         self.deiconify()
         self.lift()
+        if cloaked:
+            safety = self.after(1500, lambda: set_cloaked(self, False))  # never stay hidden
+            try:
+                paint_now(self)
+            finally:
+                set_cloaked(self, False)
+                try:
+                    self.after_cancel(safety)
+                except tkinter.TclError:
+                    pass
 
     # ------------------------------------------------------------------ window
     def _set_icon(self) -> None:
@@ -119,12 +146,17 @@ class App(ctk.CTk):
 
     def destroy(self) -> None:
         self._closing = True
-        if self._drain_job is not None:
-            try:
-                self.after_cancel(self._drain_job)
-            except Exception:  # noqa: BLE001
-                pass
-            self._drain_job = None
+        for attr in ("_drain_job", "_theme_job"):
+            job = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:  # noqa: BLE001
+                    pass
+        theme_fx = getattr(self, "theme_fx", None)
+        if theme_fx is not None:
+            theme_fx.cancel()
         toaster = getattr(self, "toaster", None)
         if toaster is not None:
             toaster.hide()
@@ -279,7 +311,22 @@ class App(ctk.CTk):
             self.settings_page.refresh()
 
     def apply_theme(self) -> None:
-        ctk.set_appearance_mode(self.cfg.get("theme", "dark"))
+        """Apply the ``theme`` setting with a cross-fade (see :mod:`ui.transition`)."""
+        self.theme_fx.switch(resolve_mode(self.cfg.get("theme")))
+
+    def _apply_mode(self, mode: str) -> None:
+        apply_appearance(self, mode)
+
+    def _watch_system_theme(self) -> None:
+        """Follow the Windows app theme while the setting is "System"."""
+        self._theme_job = None
+        if self._closing:
+            return
+        if self.cfg.get("theme") == "system":
+            mode = resolve_mode("system")
+            if mode != self.theme_fx.mode:
+                self.theme_fx.switch(mode)
+        self._theme_job = self.after(SYSTEM_POLL_MS, self._watch_system_theme)
 
     def choose_download_dir(self) -> None:
         current = str(self.cfg.get("download_dir") or "")

@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.request
 import webbrowser
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from PIL import Image, ImageDraw
@@ -67,9 +68,11 @@ def detect_platform(url: str) -> str | None:
     for prefix in ("www.", "m.", "mobile.", "vm.", "vt."):
         if host.startswith(prefix):
             host = host[len(prefix):]
-    for domains, name in sorted(_PLATFORMS, key=lambda p: -max(len(d) for d in p[0])):
-        if any(host == d or host.endswith("." + d) for d in domains):
-            return name
+    # Most specific (longest) matching domain wins, e.g. music.youtube.com over youtube.com.
+    matches = [(len(d), name) for domains, name in _PLATFORMS for d in domains
+               if host == d or host.endswith("." + d)]
+    if matches:
+        return max(matches)[1]
     return host or None
 
 
@@ -133,6 +136,85 @@ def preferred_quality(preferred: str, values: list[str]) -> str:
     return str(max(below)) if below else "best"
 
 
+def short_quality(value: str) -> str:
+    """Compact quality text for chips: "best" -> "Best", "2160" -> "4K", "720" -> "720p"."""
+    if not value or value == "best":
+        return "Best"
+    if value == "2160":
+        return "4K"
+    if value == "4320":
+        return "8K"
+    return f"{value}p" if value.isdigit() else value
+
+
+def requested_quality_text(kind: str, quality: str, mp3_bitrate: str) -> str:
+    """What the user asked for, e.g. "MP4 · 720p", "MP3 · 320 kbps", "M4A · Best"."""
+    if kind == "mp4":
+        return f"MP4 · {short_quality(quality)}"
+    if kind == "mp3":
+        return f"MP3 · {BITRATE_LABELS.get(mp3_bitrate, f'{mp3_bitrate} kbps')}"
+    return f"{kind.upper()} · Best"
+
+
+def delivered_quality_text(delivered: str) -> str:
+    """Engine's ``delivered_quality`` ("720p", "320kbps", "2160p") -> chip text ("720p", "4K").
+
+    Returns "" when the value isn't a quality (the engine may fall back to e.g. "m4a").
+    """
+    d = delivered.strip()
+    m = re.fullmatch(r"(\d+)\s*p", d, re.IGNORECASE)
+    if m:
+        return short_quality(m.group(1))
+    m = re.fullmatch(r"(\d+)\s*kbps", d, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)} kbps"
+    return "" if d.lower() in ("", "mp4", "mp3", "m4a", "audio", "video") else d
+
+
+def quality_shortfall(kind: str, requested: str, delivered: str | None) -> bool:
+    """True when a specific video height was requested but a different one was saved.
+
+    Only MP4 with an explicit height can fall short (the source had no such resolution);
+    "best" and audio formats never do.
+    """
+    if kind != "mp4" or not delivered or not requested.isdigit():
+        return False
+    m = re.match(r"\s*(\d+)", delivered)
+    return bool(m) and int(m.group(1)) != int(requested)
+
+
+_YT_ID_RE = re.compile(r"^[\w-]{11}$")
+
+
+def media_key(url: str) -> str:
+    """Canonical identity of a link for duplicate detection.
+
+    YouTube watch / youtu.be / shorts / embed links of the same video map to one key; other
+    URLs are compared case-insensitively on host with the fragment and trailing slash dropped.
+    """
+    parsed = urlparse(normalize_url(url))
+    host = (parsed.hostname or "").lower()
+    for prefix in ("www.", "m.", "music."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    vid = ""
+    if host == "youtu.be":
+        vid = parsed.path.strip("/").split("/")[0]
+    elif host.endswith("youtube.com") or host == "youtube-nocookie.com":
+        parts = [p for p in parsed.path.split("/") if p]
+        if parts and parts[0] in ("shorts", "embed", "live", "v") and len(parts) > 1:
+            vid = parts[1]
+        else:
+            query = dict(q.split("=", 1) for q in parsed.query.split("&") if "=" in q)
+            vid = query.get("v", "")
+            if not vid and query.get("list"):
+                return f"youtube:list:{query['list']}"
+    if vid and _YT_ID_RE.match(vid):
+        return f"youtube:{vid}"
+    path = parsed.path.rstrip("/") or "/"
+    return f"{host}{path}{'?' + parsed.query if parsed.query else ''}"
+
+
 def fmt_duration(seconds: float | None) -> str | None:
     if not seconds or seconds <= 0:
         return None
@@ -161,6 +243,29 @@ def fmt_ago(epoch: float) -> str:
 def truncate(text: str, limit: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def middle_ellipsis(text: str, measure: Callable[[str], int], max_px: float) -> str:
+    """Shorten ``text`` in the middle so ``measure(result) <= max_px``.
+
+    Keeps the end visible, which matters for file names like "Title [id] - 720p.mp4".
+    """
+    if max_px <= 0 or measure(text) <= max_px:
+        return text
+
+    def cut(keep: int) -> str:
+        tail = max(1, (keep * 3) // 5)
+        head = max(0, keep - tail)
+        return text[:head].rstrip() + "…" + text[len(text) - tail:].lstrip()
+
+    lo, hi = 1, len(text) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if measure(cut(mid)) <= max_px:
+            lo = mid
+        else:
+            hi = mid - 1
+    return cut(lo)
 
 
 def friendly_error(exc: BaseException) -> str:

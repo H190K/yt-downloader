@@ -19,6 +19,7 @@
 | 🎥 **MP4 with audio** | The best video stream and the best audio stream are downloaded separately and merged into one MP4 with FFmpeg - audio is always included, at every resolution |
 | 🎵 **MP3 / M4A** | Audio extraction - MP3 at 320/256/192/128 kbps, or M4A keeping the original quality |
 | 📐 **Exact quality** | The quality list shows only the resolutions the video really has, and the file you get is exactly the one you picked (4K means 2160p, not a silent fallback) |
+| 🏷️ **Quality in the file name** | `Title [id] - 720p.mp4`, `- 2160p.mp4`, `- 320kbps.mp3`, `- 128kbps.m4a` - keep several qualities of the same video side by side |
 | 📋 **Download queue** | Queue several downloads, each with its own progress bar, cancel button and "open folder" |
 | 📚 **Playlists** | Download a whole playlist when the link is one |
 | 🖼️ **Preview** | Thumbnail, title, uploader, duration and site before you download |
@@ -50,7 +51,7 @@
 ### **For End Users** (no Python required)
 1. **Download** `H190K-Downloader-Setup-<version>.exe` from the [releases](https://github.com/H190K/yt-downloader/releases) page.
 2. **Install**: run the setup. It installs to `C:\H190K Downloader` by default (you can change it) and does not need administrator rights.
-3. **First launch**: the app downloads yt-dlp, FFmpeg and Deno (about 170 MB download, ~430 MB on disk) into its `data\bin` folder. Leave the installer's *"Download required tools now"* box ticked to do this during setup.
+3. **Tools**: leave *"Download required tools now"* ticked and setup downloads yt-dlp, FFmpeg and Deno (about 250 MB) on its own progress page - no console, nothing else to do. If you untick it or you're offline, the app downloads them the first time you open it.
 4. **Paste a link, pick MP4 / MP3 / M4A, download.** Files are saved to `Downloads\H190K Downloader` by default (you can change this in Settings).
 
 ### **For Developers** (run from source)
@@ -138,10 +139,19 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1 [-Version 2.1.0] [-No
 The installer:
 - shows the MIT license, installs per-user without admin rights (default `C:\H190K Downloader`, changeable),
 - creates a Start menu folder (app, *Update H190K Downloader tools*, website / GitHub / source-code links, license, uninstall) and an optional desktop shortcut,
-- can download the required tools right after installing,
+- downloads the required tools on a *"Downloading required tools"* wizard page with progress (Retry / Skip if it fails - the app then fetches them on first run),
 - removes the downloaded tools and settings (`data\`) on uninstall.
 
-Silent install: `H190K-Downloader-Setup-<version>.exe /VERYSILENT /CURRENTUSER [/DIR="D:\Apps\H190K Downloader"]`
+Command-line install:
+
+| Switches | Tools |
+|----------|-------|
+| `/SILENT` | Downloaded with progress (Retry/Skip dialog on failure; `/SUPPRESSMSGBOXES` picks Skip) |
+| `/VERYSILENT` | Not downloaded (fast, offline-safe) - the app fetches them on first run |
+| `/VERYSILENT /DOWNLOADTOOLS` | Downloaded; failures are logged and skipped |
+| `/MERGETASKS="!downloadtools"` | Never downloaded |
+
+Example: `H190K-Downloader-Setup-<version>.exe /VERYSILENT /CURRENTUSER /DOWNLOADTOOLS [/DIR="D:\Apps\H190K Downloader"]`
 
 ---
 
@@ -155,10 +165,12 @@ yt-downloader/
 │   ├── config.py              # Settings (data/config.json)
 │   ├── deps.py                # Installs & updates yt-dlp, FFmpeg, Deno
 │   ├── engine.py              # Fetch info + download jobs (runs yt-dlp.exe)
+│   ├── tool_import.py         # Installs tools downloaded by the installer (--import-tools)
 │   └── cli.py                 # --update / --check / --setup / --download
 ├── ui/                        # CustomTkinter interface
 │   ├── app.py                 # Main window, navigation, shortcuts, first-run setup
 │   ├── download_page.py, queue_page.py, settings_page.py, about_page.py, setup_screen.py
+│   ├── transition.py          # Theme cross-fade
 │   ├── widgets.py, theme.py, util.py, backend.py
 │   └── _dev_fake.py           # Simulated backend for UI work (H190K_FAKE_BACKEND=1)
 ├── assets/
@@ -174,6 +186,7 @@ yt-downloader/
 │   └── update.bat             # Update tools (exe or source)
 ├── docs/
 │   └── ARCHITECTURE.md        # How the pieces fit together
+├── tests/                     # pytest: unit (offline) + e2e (--run-network)
 ├── requirements.txt           # Runtime dependencies
 ├── requirements-dev.txt       # + PyInstaller
 ├── CHANGELOG.md
@@ -182,6 +195,16 @@ yt-downloader/
 ```
 
 Runtime data (not in git): `data/bin/` (tools, `versions.json`), `data/cache/` and `data/config.json`.
+
+---
+
+## Tests
+
+```bat
+pip install -r requirements-dev.txt
+python -m pytest tests/unit -q                 &rem fast, offline
+python -m pytest tests -q --run-network        &rem + real downloads (needs the tools in datain)
+```
 
 ---
 

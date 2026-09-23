@@ -5,17 +5,19 @@ Public API (see CONTRACT.md): :class:`MediaInfo`, :class:`EngineError`, :func:`f
 """
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,22 @@ _SEP = "\x1f"  # unit separator: never appears in yt-dlp's numeric/progress fiel
 _DL_TAG = "[H190K-DL]"
 _PP_TAG = "[H190K-PP]"
 _FILE_TAG = "[H190K-FILE]"
+_INFO_TAG = "[H190K-INFO]"
+
+# Per-job scratch folders live inside the download folder (same volume, so the final move is a
+# cheap rename) under this hidden directory: <out_dir>/.h190k-tmp/<job id>/
+TEMP_DIR_NAME = ".h190k-tmp"
+_STALE_TEMP_SECONDS = 3 * 24 * 3600
+# Common audio bitrates; a probed bitrate within 5 % of one of these is labelled with it
+# (YouTube's "128k" AAC probes as ~129.5 kbps).
+_STD_KBPS = (32, 48, 64, 96, 112, 128, 160, 192, 224, 256, 320)
+# HTTP 403 recovery: re-extract (fresh signed URLs) this many times, then also skip the refused
+# stream and alternate the YouTube player client, up to _MAX_403_RETRIES retries in total.
+_FRESH_403_RETRIES = 2
+_MAX_403_RETRIES = 5
+_ALT_YT_CLIENT = "web_embedded"  # full format list (up to 4K) without a PO token (yt-dlp 2026.08)
+_INTERMEDIATE_RE = re.compile(r"\.f\d+[\w-]*\.\w+$|\.(part|ytdl|temp)$|\.part-Frag\d+|\.temp\.\w+$"
+                              r"|\.compat-tmp\.mp4$", re.IGNORECASE)
 
 _PP_LABELS: dict[str, str] = {
     "Merger": "Merging video and audio...",
@@ -56,7 +74,7 @@ _PP_LABELS: dict[str, str] = {
     "FixupStretched": "Fixing aspect ratio...",
     "MoveFiles": "Finishing...",
 }
-_PP_LINE_RE = re.compile(r"^\[(%s)\]" % "|".join(re.escape(k) for k in _PP_LABELS))
+_PP_LINE_RE = re.compile(r"^\[({})\]".format("|".join(re.escape(k) for k in _PP_LABELS)))
 
 
 # ====================================================================== data types
@@ -115,8 +133,45 @@ def _site_name(extractor: str | None, url: str) -> str:
     return host.removeprefix("www.") or "This site"
 
 
-def friendly_error(lines: list[str] | str, url: str = "", cookies_browser: str | None = None) -> str:
-    """Translate yt-dlp stderr output into a short, actionable message."""
+#: ``DownloadJob.error_kind`` values (the UI picks an action from these).
+ERROR_KINDS = ("login_required", "age_restricted", "members_only", "private", "http_403",
+               "unsupported_url", "network", "geo_blocked", "drm", "unavailable", "error")
+
+_UPDATE_HINT = "About & updates → Update all"
+_COOKIES_HINT = "Settings → Sign-in & cookies (Firefox recommended)"
+
+
+def http_403_message(site: str = "YouTube", cause: str = "refused", working: str | None = None) -> str:
+    """Short, non-technical explanation of an HTTP 403 plus what to try, in order.
+
+    ``cause``: ``"refused"`` (every stream was refused, often a temporary block of the connection),
+    ``"expired"`` (the link stopped working partway through a long download) or ``"quality"``
+    (only the chosen quality is blocked; ``working`` names one that downloads).
+    """
+    if cause == "expired":
+        what = (f"{site} stopped sending the file partway through (the download link expired - "
+                "this can happen on long videos or slow connections).")
+    elif cause == "quality":
+        what = f"{site} is blocking this quality of the video right now."
+    else:
+        what = (f"{site} refused to send this video, even after retrying with other streams. "
+                "This is usually a temporary block of your connection.")
+    if working:
+        first = f"try {working}"
+    elif cause == "expired":
+        first = "try again"
+    else:
+        first = "try another quality"
+    return (f"{what}\nWhat to try: {first}; update the tools ({_UPDATE_HINT}); try again later or "
+            f"on another network (VPN off/on); or sign in via {_COOKIES_HINT}.\n(HTTP 403)")
+
+
+def diagnose_error(lines: list[str] | str, url: str = "",
+                   cookies_browser: str | None = None) -> tuple[str, str]:
+    """Classify yt-dlp output: returns ``(error_kind, user-friendly message)``.
+
+    ``error_kind`` is one of :data:`ERROR_KINDS`.
+    """
     text = lines if isinstance(lines, str) else "\n".join(lines)
     errors = [ln for ln in text.splitlines() if ln.startswith("ERROR:")]
     main = errors[-1] if errors else (text.strip().splitlines()[-1] if text.strip() else "")
@@ -128,62 +183,74 @@ def friendly_error(lines: list[str] | str, url: str = "", cookies_browser: str |
         else f"Make sure you're logged in to {site} in {cookies_browser.title()}, then try again."
     )
 
-    browser = (cookies_browser or "the browser").title()
+    browser = cookies_browser.title() if cookies_browser else None
     if "failed to decrypt" in low or "dpapi" in low:
-        return (f"{browser} encrypts its cookies so they can't be read (app-bound encryption). "
-                "Log in to the site in Firefox and choose Firefox for cookies in Settings.")
+        return "login_required", (
+            f"{browser or 'The browser'} encrypts its cookies so they can't be read (app-bound "
+            "encryption). Log in to the site in Firefox and choose Firefox for cookies in Settings.")
     if "could not find" in low and "cookies database" in low:
-        return f"No {browser} cookies were found (is it installed?). Choose another browser in Settings."
+        return "login_required", (
+            f"No {browser} cookies were found (is it installed?). Choose another browser in Settings."
+            if browser else
+            "No browser cookies were found (is the browser installed?). Choose another browser in Settings.")
     if "could not copy" in low and "cookie" in low:
-        return f"Couldn't read cookies from {browser}. Close it completely and try again."
+        return "login_required", (f"Couldn't read cookies from {browser or 'the browser'}. "
+                                  "Close it completely and try again.")
     if "drm protected" in low or "drm-protected" in low:
-        return "This video is DRM-protected and can't be downloaded."
+        return "drm", "This video is DRM-protected and can't be downloaded."
     if "unsupported url" in low:
-        return "This link isn't supported. Check the URL or try a direct link to the video."
+        return "unsupported_url", "This link isn't supported. Check the URL or try a direct link to the video."
     if "is not a valid url" in low or "no such file or directory" in low and "http" not in url:
-        return "That doesn't look like a valid link."
+        return "unsupported_url", "That doesn't look like a valid link."
     if "confirm your age" in low or "age-restricted" in low or "age restricted" in low \
             or "inappropriate for some users" in low:
-        return f"This video is age-restricted and requires a signed-in account. {cookie_hint}"
+        return "age_restricted", f"This video is age-restricted and requires a signed-in account. {cookie_hint}"
     if "not a bot" in low:
-        return f"{site} asked to confirm you're not a bot. {cookie_hint}"
+        return "login_required", f"{site} asked to confirm you're not a bot. {cookie_hint}"
     if "private video" in low or "this video is private" in low or "private account" in low:
-        return f"This content is private. {cookie_hint}"
+        return "private", f"This content is private. {cookie_hint}"
     if ("login required" in low or "requires login" in low or "log in" in low or "login_required" in low
             or "rate-limit reached or login required" in low or "use --cookies" in low
             or "cookies-from-browser" in low or "authentication" in low and "required" in low
             or "sign in" in low):
-        return f"{site} requires login for this content. {cookie_hint}"
+        return "login_required", f"{site} requires login for this content. {cookie_hint}"
     if "members-only" in low or "join this channel" in low or "premium" in low and "member" in low:
-        return f"This content is for members only. {cookie_hint}"
-    if "not available in your country" in low or "geo restrict" in low or "geo-restrict" in low \
+        return "members_only", f"This content is for members only. {cookie_hint}"
+    if "available in your country" in low or "geo restrict" in low or "geo-restrict" in low \
             or "blocked it in your country" in low or "not available from your location" in low:
-        return "This content is not available in your country (geo-blocked)."
+        return "geo_blocked", "This content is not available in your country (geo-blocked)."
     if "http error 429" in low or "too many requests" in low:
-        return f"{site} is rate-limiting requests. Wait a few minutes and try again."
+        return "error", f"{site} is rate-limiting requests. Wait a few minutes and try again."
+    if "http error 403" in low or "403: forbidden" in low:
+        return "http_403", http_403_message(site)
     if "live event will begin" in low or "premieres in" in low or "is upcoming" in low:
-        return "This is a scheduled live stream/premiere that hasn't started yet."
+        return "unavailable", "This is a scheduled live stream/premiere that hasn't started yet."
     if "video unavailable" in low or "this video is unavailable" in low or "has been removed" in low \
             or "no longer available" in low or "http error 404" in low or "does not exist" in low:
-        return "This video is unavailable (it may have been removed or the link is wrong)."
+        return "unavailable", "This video is unavailable (it may have been removed or the link is wrong)."
     if "requested format is not available" in low:
-        return "The requested quality/format isn't available for this video. Try another quality."
+        return "error", "The requested quality/format isn't available for this video. Try another quality."
     if "no video formats found" in low or "no media found" in low or "there's no video in this" in low:
-        return "No downloadable media was found at this link."
+        return "unavailable", "No downloadable media was found at this link."
     if "ffmpeg" in low and ("not found" in low or "not installed" in low):
-        return "FFmpeg is missing. Run the setup/update again."
+        return "error", "FFmpeg is missing. Run the setup/update again."
     if any(s in low for s in ("getaddrinfo failed", "failed to resolve", "name or service not known",
                               "timed out", "connection reset", "connection refused", "network is unreachable",
                               "unable to download webpage", "unable to download json", "urlopen error",
                               "remote end closed connection", "connection aborted", "ssl:")):
-        return "Network error. Check your internet connection and try again."
+        return "network", "Network error. Check your internet connection and try again."
     if "no space left" in low or "errno 28" in low:
-        return "Not enough disk space in the download folder."
+        return "error", "Not enough disk space in the download folder."
     if "permission denied" in low or "errno 13" in low:
-        return "Can't write to the download folder (permission denied). Choose another folder."
+        return "error", "Can't write to the download folder (permission denied). Choose another folder."
     msg = re.sub(r"^ERROR:\s*", "", main)
     msg = re.sub(r"^\[[^\]]+\]\s*[\w-]*:\s*", "", msg).strip()
-    return msg[:300] or "Download failed for an unknown reason."
+    return "error", msg[:300] or "Download failed for an unknown reason."
+
+
+def friendly_error(lines: list[str] | str, url: str = "", cookies_browser: str | None = None) -> str:
+    """Translate yt-dlp stderr output into a short, actionable message."""
+    return diagnose_error(lines, url, cookies_browser)[1]
 
 
 def normalize_url(url: str) -> str:
@@ -193,10 +260,10 @@ def normalize_url(url: str) -> str:
     ``player.vimeo.com`` form, which (unlike the page) usually works without a Vimeo login.
     """
     url = (url or "").strip().strip('"').strip("'")
-    has_scheme = re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I)
-    if url and not has_scheme and re.match(r"^[\w.-]+\.[a-z]{2,}(/|$)", url, re.I):
+    has_scheme = re.match(r"^[a-z][a-z0-9+.-]*://", url, re.IGNORECASE)
+    if url and not has_scheme and re.match(r"^[\w.-]+\.[a-z]{2,}(/|$)", url, re.IGNORECASE):
         url = "https://" + url
-    m = re.match(r"^https?://(?:www\.)?vimeo\.com/(\d+)(?:/([0-9a-f]{6,}))?/?(?:[?#].*)?$", url, re.I)
+    m = re.match(r"^https?://(?:www\.)?vimeo\.com/(\d+)(?:/([0-9a-f]{6,}))?/?(?:[?#].*)?$", url, re.IGNORECASE)
     if m:
         url = f"https://player.vimeo.com/video/{m.group(1)}" + (f"?h={m.group(2)}" if m.group(2) else "")
     return url
@@ -247,7 +314,7 @@ def _kill_tree(proc: subprocess.Popen[Any]) -> None:
         return
     if sys.platform == "win32":
         try:
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False,
                            creationflags=CREATE_NO_WINDOW, timeout=15, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             pass
@@ -343,7 +410,7 @@ def fetch_info(url: str, deps: DependencyManager, cookies_browser: str | None = 
         EngineError: with a user-friendly message on failure or cancellation.
     """
     url = normalize_url(url)
-    if not re.match(r"^https?://", url, re.I):
+    if not re.match(r"^https?://", url, re.IGNORECASE):
         raise EngineError("That doesn't look like a valid link.")
     _require_ready(deps)
     base = _base_args(deps, cookies_browser)
@@ -427,13 +494,80 @@ def _best_thumbnail(info: dict[str, Any]) -> str | None:
     return max(thumbs, key=score)["url"]
 
 
+# ====================================================================== naming
+def _norm_quality(quality: str | None) -> str:
+    """``"720p"``/``"720"`` -> ``"720"``; anything invalid -> ``"best"``."""
+    q = str(quality or "best").strip().lower().removesuffix("p")
+    return q if q.isdigit() and int(q) > 0 else "best"
+
+
+def requested_label(options: JobOptions) -> str:
+    """File-name quality label used while downloading (before the real quality is known).
+
+    MP4: ``"720p"`` or ``"best"``; MP3: ``"320kbps"``; M4A: ``"m4a"``. After the download the
+    engine renames MP4/M4A files to the delivered quality (see :attr:`DownloadJob.delivered_quality`).
+    """
+    kind = options.kind if options.kind in KINDS else "mp4"
+    if kind == "mp4":
+        q = _norm_quality(options.quality)
+        return "best" if q == "best" else f"{int(q)}p"
+    if kind == "mp3":
+        return f"{_mp3_bitrate(options)}kbps"
+    return "m4a"
+
+
+def _mp3_bitrate(options: JobOptions) -> str:
+    return options.mp3_bitrate if options.mp3_bitrate in MP3_BITRATES else "320"
+
+
+def output_template(options: JobOptions) -> str:
+    """yt-dlp ``-o`` template: ``<title> [<id>] - <label>.<ext>`` (playlists: in a sub-folder)."""
+    suffix = f" - {requested_label(options)}.%(ext)s"
+    if options.playlist:
+        return ("%(playlist_title,playlist_id|Playlist).100B/"
+                "%(playlist_index|0)03d - %(title).150B [%(id)s]" + suffix)
+    return "%(title).150B [%(id)s]" + suffix
+
+
+def _kbps_label(bits_per_second: float | None) -> str | None:
+    if not bits_per_second or bits_per_second <= 0:
+        return None
+    kbps = bits_per_second / 1000
+    for std in _STD_KBPS:
+        if abs(kbps - std) <= std * 0.05:
+            return f"{std}kbps"
+    return f"{round(kbps)}kbps"
+
+
 # ====================================================================== command building
-def build_download_args(url: str, options: JobOptions, deps: DependencyManager) -> list[str]:
-    """Return the full yt-dlp command line for a download job."""
+def _exclude_formats(selector: str, format_ids: Sequence[str]) -> str:
+    """Add ``[format_id!~='^ID$']`` filters for ``format_ids`` to every atom of ``selector``.
+
+    (A plain ``[format_id!=140]`` is parsed by yt-dlp as a *numeric* filter and never matches.)
+    """
+    if not format_ids:
+        return selector
+    filt = "".join(f"[format_id!~='^{re.escape(i)}$']" for i in format_ids)
+    return "/".join("+".join(atom + filt for atom in alt.split("+")) for alt in selector.split("/"))
+
+
+def build_download_args(url: str, options: JobOptions, deps: DependencyManager,
+                        temp_dir: str | None = None, force_overwrites: bool = False,
+                        exclude_formats: Sequence[str] = (),
+                        player_client: str | None = None) -> list[str]:
+    """Return the full yt-dlp command line for a download job.
+
+    Args:
+        temp_dir: per-job scratch folder for ``.part``/``.fNNN``/thumbnail files. The finished
+            file is moved from there to ``options.out_dir`` by yt-dlp.
+        force_overwrites: re-download even if the final file already exists.
+        exclude_formats: format ids never to pick (streams the site refused with HTTP 403).
+        player_client: YouTube player client to extract with (e.g. ``"web_embedded"``).
+    """
     kind = options.kind if options.kind in KINDS else "mp4"
     args = _base_args(deps, options.cookies_browser)
     args += [
-        "--newline", "--progress", "--no-quiet",
+        "--newline", "--progress", "--no-quiet", "--no-simulate",
         "--no-mtime", "--windows-filenames",
         "--concurrent-fragments", "4",
         "--progress-template",
@@ -442,23 +576,29 @@ def build_download_args(url: str, options: JobOptions, deps: DependencyManager) 
             "%(progress.total_bytes_estimate)s", "%(progress.speed)s", "%(progress.eta)s",
             "%(progress.fragment_index)s", "%(progress.fragment_count)s",
             "%(info.vcodec)s", "%(info.acodec)s", "%(info.playlist_index)s", "%(info.n_entries)s",
+            "%(info.format_id)s",
         ]),
         "--progress-template", "postprocess:" + _PP_TAG + "%(progress.status)s" + _SEP
         + "%(progress.postprocessor)s",
-        "--print", "after_move:" + _FILE_TAG + "%(filepath)s",
-        "-P", options.out_dir or ".",
+        "--print", "before_dl:" + _INFO_TAG + _SEP.join(["%(id)s", "%(duration)s", "%(vcodec)s",
+                                                          "%(width)s", "%(height)s", "%(acodec)s"]),
+        "--print", "after_move:" + _FILE_TAG + "%(id)s" + _SEP + "%(filepath)s",
     ]
-    if options.playlist:
-        args += ["--yes-playlist", "--ignore-errors",
-                 "-o", "%(playlist_title,playlist_id|Playlist).100B/"
-                       "%(playlist_index|0)03d - %(title).150B [%(id)s].%(ext)s"]
+    if temp_dir:
+        # Both absolute: yt-dlp resolves a relative "temp:" path against "home".
+        args += ["-P", "home:" + os.path.abspath(options.out_dir or "."),
+                 "-P", "temp:" + os.path.abspath(temp_dir)]
     else:
-        args += ["--no-playlist", "-o", "%(title).150B [%(id)s].%(ext)s"]
+        args += ["-P", options.out_dir or "."]
+    if force_overwrites:
+        args += ["--force-overwrites"]
+    if player_client:
+        args += ["--extractor-args", f"youtube:player_client={player_client}"]
+    args += ["--yes-playlist", "--ignore-errors"] if options.playlist else ["--no-playlist"]
+    args += ["-o", output_template(options)]
 
     if kind == "mp4":
-        q = str(options.quality or "best").strip().lower().removesuffix("p")
-        if q != "best" and not (q.isdigit() and int(q) > 0):
-            q = "best"
+        q = _norm_quality(options.quality)
         # Resolution first (exact requested height when it exists; "res" is the smaller dimension so
         # portrait videos/Shorts work), then fps, then codec compatibility (H.264 > VP9 > AV1 at the
         # same resolution), then AAC audio. High resolutions on YouTube are video-only VP9/AV1
@@ -466,16 +606,17 @@ def build_download_args(url: str, options: JobOptions, deps: DependencyManager) 
         res = "res" if q == "best" else f"res:{int(q)}"
         fmt = "bv*+ba/b"
         sort = f"{res},fps,vcodec:h264,acodec:aac,ext:mp4:m4a"
-        args += ["-f", fmt, "-S", sort, "--merge-output-format", "mp4", "--remux-video", "mp4"]
+        args += ["-f", _exclude_formats(fmt, exclude_formats), "-S", sort, "--merge-output-format", "mp4", "--remux-video", "mp4"]
         if options.embed_thumbnail:
             args += ["--embed-thumbnail"]
     elif kind == "mp3":
-        br = options.mp3_bitrate if options.mp3_bitrate in MP3_BITRATES else "320"
-        args += ["-f", "ba/b", "-x", "--audio-format", "mp3", "--audio-quality", f"{br}K"]
+        br = _mp3_bitrate(options)
+        args += ["-f", _exclude_formats("ba/b", exclude_formats), "-x", "--audio-format", "mp3", "--audio-quality", f"{br}K"]
         if options.embed_thumbnail:
             args += ["--embed-thumbnail"]
     else:  # m4a
-        args += ["-f", "ba[acodec^=mp4a]/ba[ext=m4a]/ba/b", "-S", "acodec:aac",
+        args += ["-f", _exclude_formats("ba[acodec^=mp4a]/ba[ext=m4a]/ba/b", exclude_formats),
+                 "-S", "acodec:aac",
                  "-x", "--audio-format", "m4a", "--audio-quality", "256K"]
         if options.embed_thumbnail:
             args += ["--embed-thumbnail"]
@@ -485,19 +626,37 @@ def build_download_args(url: str, options: JobOptions, deps: DependencyManager) 
     return args
 
 
-def probe_streams(path: str, deps: DependencyManager) -> list[dict[str, Any]]:
-    """Return ffprobe stream info (codec_type, codec_name, attached_pic) for ``path``."""
+def _probe_media(path: str, deps: DependencyManager) -> dict[str, Any] | None:
+    """Probe ``path`` with ffprobe.
+
+    Returns ``{"streams": [...], "duration": float | None}`` (``streams`` is empty when ffprobe
+    can't read the file), or ``None`` when ffprobe itself is unavailable / couldn't run.
+    """
+    if not deps.ffprobe_path.is_file():
+        return None
     try:
         proc = subprocess.run(
             [str(deps.ffprobe_path), "-v", "error", "-show_entries",
-             "stream=index,codec_type,codec_name,width,height:stream_disposition=attached_pic", "-of", "json", path],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+             ("stream=index,codec_type,codec_name,width,height,bit_rate:stream_disposition=attached_pic"
+              ":format=duration,bit_rate"), "-of", "json", path],
+            capture_output=True, check=False, text=True, encoding="utf-8", errors="replace", timeout=120,
             creationflags=CREATE_NO_WINDOW, stdin=subprocess.DEVNULL,
         )
-        streams = json.loads(proc.stdout or "{}").get("streams") or []
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return []
-    return [
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        data = {}
+    fmt = data.get("format") or {}
+
+    def num(v: Any) -> float | None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    streams = [
         {
             "type": s.get("codec_type"),
             "codec": s.get("codec_name"),
@@ -505,28 +664,104 @@ def probe_streams(path: str, deps: DependencyManager) -> list[dict[str, Any]]:
             "width": s.get("width"),
             "height": s.get("height"),
             "index": s.get("index"),
+            "bit_rate": num(s.get("bit_rate")),
         }
-        for s in streams
+        for s in (data.get("streams") or [])
     ]
+    return {"streams": streams, "duration": num(fmt.get("duration"))}
+
+
+def probe_streams(path: str, deps: DependencyManager) -> list[dict[str, Any]]:
+    """Return ffprobe stream info (type, codec, attached_pic, width, height, index, bit_rate)."""
+    media = _probe_media(path, deps)
+    return media["streams"] if media else []
 
 
 def probe_duration(path: str, deps: DependencyManager) -> float | None:
     """Return the media duration in seconds (None if unknown)."""
+    media = _probe_media(path, deps)
+    return media["duration"] if media else None
+
+
+def _hide_dir(path: str) -> None:
+    if sys.platform != "win32":
+        return
     try:
-        proc = subprocess.run(
-            [str(deps.ffprobe_path), "-v", "error", "-show_entries", "format=duration", "-of",
-             "default=nw=1:nk=1", path],
-            capture_output=True, text=True, timeout=60, creationflags=CREATE_NO_WINDOW,
-            stdin=subprocess.DEVNULL,
-        )
-        return float(proc.stdout.strip())
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
+        import ctypes
+
+        FILE_ATTRIBUTE_HIDDEN = 0x2
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(path)  # type: ignore[attr-defined]
+        if attrs != -1 and not attrs & FILE_ATTRIBUTE_HIDDEN:
+            ctypes.windll.kernel32.SetFileAttributesW(path, attrs | FILE_ATTRIBUTE_HIDDEN)  # type: ignore[attr-defined]
+    except (OSError, AttributeError):
+        pass
+
+
+def _remove_tree(path: str) -> None:
+    """``rmtree`` that waits a little for handles held by a just-killed process."""
+    for _ in range(15):
+        if not os.path.exists(path):
+            return
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            return
+        time.sleep(0.4)
+
+
+def _remove_file(path: str) -> None:
+    for _ in range(10):  # the killed process may still hold a handle for a moment
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            time.sleep(0.3)
+        except OSError:
+            return
+
+
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+# Final files produced by running jobs of this process (normcased path -> job id). Placing a file
+# (relabel / rescue move) happens under _OUTPUT_LOCK, so a job never replaces a file another job
+# owns: two jobs that end up with the same quality share one file.
+_OUTPUT_LOCK = threading.Lock()
+_CLAIMS: dict[str, str] = {}
+
+
+def _claim(path: str, job_id: str) -> None:
+    with _OUTPUT_LOCK:
+        _CLAIMS.setdefault(os.path.normcase(os.path.abspath(path)), job_id)
+
+
+def _claimed_by_other(path: str, job_id: str) -> bool:
+    with _OUTPUT_LOCK:
+        owner = _CLAIMS.get(os.path.normcase(os.path.abspath(path)))
+    return owner is not None and owner != job_id
+
+
+def _release_claims(job_id: str) -> None:
+    with _OUTPUT_LOCK:
+        for key in [k for k, v in _CLAIMS.items() if v == job_id]:
+            del _CLAIMS[key]
+
+
+def _res_name(res: int) -> str:
+    return {4320: "8K", 2160: "4K"}.get(res, f"{res}p")
 
 
 # ====================================================================== DownloadJob
 class DownloadJob:
-    """A single download (video, audio, or playlist) running yt-dlp in a worker thread."""
+    """A single download (video, audio, or playlist) running yt-dlp in a worker thread.
+
+    Every job downloads into its own scratch folder (``<out_dir>/.h190k-tmp/<id>``), so two jobs
+    for the same video never share ``.part``/``.fNNN``/thumbnail files; the folder is removed when
+    the job ends (success, failure or cancel). Finished files are named
+    ``<title> [<id>] - <quality>.<ext>`` where ``<quality>`` is the *delivered* quality
+    (``720p``, ``2160p``, ``320kbps``, ``128kbps``...), also exposed as :attr:`delivered_quality`.
+    """
 
     def __init__(self, url: str, title: str, options: JobOptions, deps: DependencyManager) -> None:
         self.id: str = uuid.uuid4().hex[:12]
@@ -538,6 +773,19 @@ class DownloadJob:
         self.output_path: str | None = None
         self.output_paths: list[str] = []
         self.error: str | None = None
+        #: Quality of the saved file(s): "720p", "2160p", "320kbps", "128kbps"... (None until done).
+        #: For playlists with mixed qualities: the highest one.
+        self.delivered_quality: str | None = None
+        #: Non-fatal problem on a successful job (e.g. thumbnail couldn't be embedded).
+        self.warning: str | None = None
+        #: True when the file already existed and was reused instead of downloaded again.
+        self.already_downloaded: bool = False
+        #: This job's scratch folder (removed when the job ends).
+        self.temp_dir: str | None = None
+        #: On failure: one of ERROR_KINDS ("http_403", "login_required", ...); None otherwise.
+        self.error_kind: str | None = None
+        #: On failure: a quality known to work for this video ("720p"), if the engine found one.
+        self.suggested_quality: str | None = None
 
         self._proc: subprocess.Popen[str] | None = None
         self._thread: threading.Thread | None = None
@@ -546,6 +794,15 @@ class DownloadJob:
         self._tail: deque[str] = deque(maxlen=60)
         self._touched: set[str] = set()     # files yt-dlp wrote / was writing (for cleanup)
         self._video_ids: set[str] = set()
+        self._items: dict[str, dict[str, Any]] = {}   # video id -> {"duration", "vcodec"}
+        self._printed: list[tuple[str, str]] = []     # (video id, final path) from yt-dlp
+        self._existing: set[str] = set()              # "has already been downloaded" paths
+        self._fmt_list: list[str] = []                # format ids of the current download
+        self._fmt_done: set[str] = set()              # ... that finished downloading
+        self._fmt_bytes: dict[str, float] = {}        # ... bytes received per format id
+        self._saw_403 = False
+        self._excluded: list[str] = []                # format ids refused with HTTP 403
+        self._planned: dict[str, int] = {}            # video id -> resolution first selected
         self._on_progress: ProgressCb | None = None
         self._on_done: DoneCb | None = None
         self._item = ""
@@ -591,35 +848,37 @@ class DownloadJob:
             return
         if not percent and fraction is not None:
             percent = f"{fraction * 100:.1f}%"
-        try:
+        with contextlib.suppress(Exception):  # never let UI errors kill the worker
             self._on_progress(self, {
                 "fraction": fraction, "percent": percent, "speed": speed, "eta": eta,
                 "status": status, "message": message, "item": self._item,
             })
-        except Exception:  # noqa: BLE001 - never let UI errors kill the worker
-            pass
 
     def _finish(self, ok: bool, message: str) -> None:
         if self._on_done is None:
             return
-        try:
+        with contextlib.suppress(Exception):
             self._on_done(self, ok, message)
-        except Exception:  # noqa: BLE001
-            pass
 
     def _run(self) -> None:
         try:
             ok, msg = self._run_inner()
         except Exception as exc:  # noqa: BLE001 - last-resort guard
             ok, msg = False, f"Unexpected error: {exc}"
+        with contextlib.suppress(Exception):  # cleanup must never change the outcome
+            self._cleanup_partials()
+        _release_claims(self.id)
         if self._cancelled.is_set():
             self.state = "cancelled"
-            self._cleanup_partials()
+            self.error_kind = None
             self._finish(False, "Cancelled.")
             return
         self.state = "done" if ok else "error"
-        if not ok:
+        if ok:
+            self.error_kind = None
+        else:
             self.error = msg
+            self.error_kind = self.error_kind or "error"
         self._finish(ok, msg)
 
     def _run_inner(self) -> tuple[bool, str]:
@@ -627,20 +886,83 @@ class DownloadJob:
             _require_ready(self.deps)
         except EngineError as exc:
             return False, str(exc)
-        out_dir = self.options.out_dir or str(Path.home() / "Downloads")
+        # Absolute: yt-dlp resolves a relative "temp:" path against "home".
+        out_dir = os.path.abspath(self.options.out_dir or str(Path.home() / "Downloads"))
         try:
             os.makedirs(out_dir, exist_ok=True)
         except OSError:
             return False, "Can't create the download folder. Choose another folder in Settings."
         self.options.out_dir = out_dir
+        self.temp_dir = self._make_temp_dir(out_dir)
 
-        args = build_download_args(normalize_url(self.url), self.options, self.deps)
+        url = normalize_url(self.url)
+        is_youtube = _site_name(None, url) == "YouTube"
+        force = False
+        client: str | None = None
+        retries_403 = 0
+        while True:
+            ok, msg, action = self._attempt(url, force, client)
+            if ok or self._cancelled.is_set():
+                return ok, msg
+            if action == "overwrite" and not force:
+                # The file on disk claimed "already downloaded" but is damaged: download it again.
+                force = True
+            elif action == "403" and retries_403 < _MAX_403_RETRIES:
+                retries_403 += 1
+                failing, partway = self._failing_format()
+                # 1-2: fresh extraction = new signed URLs (the .part in the scratch folder resumes).
+                # Then: skip the refused stream (-> same resolution in another codec, then lower)
+                # and alternate the YouTube player client.
+                if retries_403 > _FRESH_403_RETRIES and failing and not partway:
+                    if failing not in self._excluded:
+                        self._excluded.append(failing)
+                    if is_youtube:
+                        client = _ALT_YT_CLIENT if client is None else None
+                self._emit(None, "downloading",
+                           f"The site refused the stream - retrying ({retries_403}/{_MAX_403_RETRIES})...")
+                if self._cancelled.wait(min(1.5 * retries_403, 5.0)):
+                    return False, "Cancelled."
+            else:
+                return ok, msg
+            self._reset_attempt()
+
+    def _reset_attempt(self) -> None:
+        self._printed.clear()
+        self._existing.clear()
+        self._items.clear()
+        self._tail.clear()
+        self._fmt_list, self._fmt_done, self._fmt_bytes = [], set(), {}
+        self._saw_403 = False
+        self.output_paths = []
+        self.output_path = None
+        self.warning = None
+        self.error_kind = None
+        self.already_downloaded = False
+        self._failed_items = self._expected_items = 0
+        self._part_index, self._part_count, self._part_frac = 0, 1, 0.0
+
+    def _failing_format(self) -> tuple[str | None, bool]:
+        """(format id that was being downloaded when the attempt failed, had it received data?)."""
+        for fid in self._fmt_list:
+            if fid not in self._fmt_done:
+                return fid, self._fmt_bytes.get(fid, 0) > 0
+        return None, False
+
+    def _attempt(self, url: str, force_overwrites: bool,
+                 client: str | None = None) -> tuple[bool, str, str | None]:
+        """Run yt-dlp once and verify the result.
+
+        Returns ``(ok, message, action)``; ``action`` is ``"overwrite"`` (existing file is damaged:
+        re-download), ``"403"`` (the site refused a stream: worth retrying) or None.
+        """
+        args = build_download_args(url, self.options, self.deps, self.temp_dir, force_overwrites,
+                                   exclude_formats=self._excluded, player_client=client)
         self.state = "downloading"
         self._emit(None, "downloading", "Starting...")
         try:
             proc = _popen(args)
         except OSError as exc:
-            return False, f"Could not start yt-dlp: {exc}"
+            return False, f"Could not start yt-dlp: {exc}", None
         with self._lock:
             self._proc = proc
         if self._cancelled.is_set():
@@ -649,37 +971,94 @@ class DownloadJob:
         assert proc.stdout is not None
         for raw in proc.stdout:
             line = raw.rstrip("\r\n")
-            if not line:
-                continue
-            self._handle_line(line)
+            if line:
+                self._handle_line(line)
         proc.wait()
         if self._cancelled.is_set():
-            return False, "Cancelled."
+            return False, "Cancelled.", None
 
-        files = [p for p in self.output_paths if os.path.isfile(p)]
-        if not files and self.output_paths:
-            files = self._find_outputs()
-        if proc.returncode != 0 and not files:
-            return False, friendly_error(list(self._tail), self.url, self.options.cookies_browser)
-        if not files:
-            if any("has already been downloaded" in ln for ln in self._tail):
-                return True, self.output_path or "Already downloaded."
-            return False, friendly_error(list(self._tail), self.url, self.options.cookies_browser)
-
-        if self.options.kind == "mp4":
-            for i, path in enumerate(files):
+        # Success is decided by the files, not by yt-dlp's exit code: a non-zero exit with a
+        # complete, playable file means a non-fatal step (thumbnail, metadata...) failed.
+        candidates = self._collect_outputs()
+        final: list[str] = []
+        labels: list[str] = []
+        damaged_existing = damaged = False
+        for i, (path, vid, strict) in enumerate(candidates):
+            if self._cancelled.is_set():
+                return False, "Cancelled.", None
+            existing = any(_same_path(path, p) for p in self._existing)
+            label = self._validate(path, vid, strict=strict or existing)
+            if label is None:
+                damaged = True
+                if existing:
+                    damaged_existing = True
+                elif not strict and not _claimed_by_other(path, self.id):
+                    _remove_file(path)  # never leave a broken file behind looking like a download
+                continue
+            if strict:  # rescued from the scratch folder: move it where yt-dlp would have
+                moved = self._move_to_output(path, vid)
+                if moved is None:
+                    continue
+                path, adopted = moved
+                existing = existing or adopted
+            if self.options.kind == "mp4" and not existing:
+                self._ensure_mp4_compat(path, i, len(candidates))
                 if self._cancelled.is_set():
-                    return False, "Cancelled."
-                self._ensure_mp4_compat(path, i, len(files))
-        self.output_path = files[-1] if len(files) == 1 else os.path.dirname(files[-1])
+                    return False, "Cancelled.", None
+            path, adopted = self._relabel(path, label, vid)
+            if existing or adopted:
+                self._existing.add(path)
+            final.append(path)
+            labels.append(label)
+
+        if not final:
+            if damaged_existing and not force_overwrites:
+                return False, "", "overwrite"
+            has_error = any(ln.startswith("ERROR:") for ln in self._tail)
+            if damaged and not has_error:
+                self.error_kind = "error"
+                return False, "The downloaded file is incomplete or damaged. Please try again.", None
+            if self._saw_403:
+                self.error_kind = "http_403"
+                if not self.options.playlist:
+                    _failing, partway = self._failing_format()
+                    return False, http_403_message(_site_name(None, url),
+                                                   "expired" if partway else "refused"), "403"
+            kind, message = diagnose_error(list(self._tail), self.url, self.options.cookies_browser)
+            self.error_kind = kind
+            return False, message, None
+
+        self.output_paths = final
+        self.output_path = final[0] if len(final) == 1 else os.path.dirname(final[-1])
+        self.delivered_quality = self._summarize_labels(labels)
+        self.already_downloaded = all(any(_same_path(p, e) for e in self._existing) for p in final)
+        if proc.returncode != 0 and any(ln.startswith("ERROR:") for ln in self._tail) \
+                and not self.options.playlist:
+            self.warning = friendly_error(list(self._tail), self.url, self.options.cookies_browser)
+        fallback = self._fallback_note(labels)
+        if fallback:
+            self.warning = fallback
         if self.options.playlist:
-            failed = max(self._expected_items - len(files), 0) if self._expected_items else self._failed_items
+            failed = max(self._expected_items - len(final), 0) if self._expected_items else self._failed_items
             if failed:
                 return True, (f"Finished with errors: {failed} of {self._expected_items or '?'} item(s) "
-                              f"failed. Saved to {self.output_path}")
-        # A non-zero exit with the final file present means a non-fatal post-processing step
-        # (e.g. thumbnail embedding) failed; the media itself is fine.
-        return True, self.output_path
+                              f"failed. Saved to {self.output_path}"), None
+        elif self.already_downloaded:
+            return True, f"Already in your download folder ({self.delivered_quality})", None
+        return True, self.output_path, None
+
+    def _fallback_note(self, labels: list[str]) -> str | None:
+        """Explain a lower resolution caused by refused (HTTP 403) streams."""
+        if not self._excluded or self.options.kind != "mp4" or not labels:
+            return None
+        planned = max(self._planned.values(), default=0)
+        m = re.match(r"^(\d+)p$", labels[0])
+        got = int(m.group(1)) if m else 0
+        if not planned or not got or got >= planned:
+            return None
+        site = _site_name(None, self.url)
+        return (f"{_res_name(planned)} isn't downloadable for this video right now ({site} blocked "
+                f"that stream with HTTP 403). Saved in {_res_name(got)} instead.")
 
     # ------------------------------------------------------------ output parsing
     def _handle_line(self, line: str) -> None:
@@ -697,18 +1076,47 @@ class DownloadJob:
                 self._emit(None, "processing", _PP_LABELS.get(name, f"Processing ({name})..."))
             return
         if line.startswith(_FILE_TAG):
-            path = line[len(_FILE_TAG):].strip()
+            vid, sep, path = line[len(_FILE_TAG):].partition(_SEP)
+            if not sep:
+                vid, path = "", vid
+            path = path.strip()
             if path:
-                self.output_paths.append(path)
-                self.output_path = path
+                self._printed.append((vid, path))
+                if vid:
+                    self._video_ids.add(vid)
+            return
+        if line.startswith(_INFO_TAG):
+            parts = line[len(_INFO_TAG):].split(_SEP)
+            if len(parts) >= 3 and parts[0] not in ("", "NA"):
+                try:
+                    duration: float | None = float(parts[1])
+                except ValueError:
+                    duration = None
+                self._items[parts[0]] = {"duration": duration, "vcodec": parts[2],
+                                         "acodec": parts[5] if len(parts) > 5 else "NA"}
+                self._video_ids.add(parts[0])
+                dims = [int(x) for x in parts[3:5] if x.isdigit() and int(x) > 0]
+                if dims and parts[0] not in self._planned:  # first attempt's choice
+                    self._planned[parts[0]] = min(dims)
             return
 
         self._tail.append(line)
+        if "HTTP Error 403" in line:
+            self._saw_403 = True
+        m = re.match(r'^WARNING: Cannot move file ".+" out of temporary directory since "(.+)" already exists',
+                     line)
+        if m:  # another job placed the same quality first: that file is ours too
+            self._existing.add(m.group(1))
+            return
         m = re.match(r"^\[download\] Destination: (.+)$", line)
         if m:
             self._touched.add(m.group(1).strip())
             if self.state != "downloading":
                 self.state = "downloading"
+            return
+        m = re.match(r"^\[download\] (.+) has already been downloaded$", line)
+        if m:
+            self._existing.add(m.group(1).strip())
             return
         m = re.match(r"^\[download\] Downloading (?:item|video) (\d+) of (\d+)", line)
         if m:
@@ -721,6 +1129,8 @@ class DownloadJob:
         m = re.match(r"^\[info\] ([^:\s]+): Downloading \d+ format\(s\): (\S+)", line)
         if m:
             self._video_ids.add(m.group(1))
+            self._fmt_list = m.group(2).split("+")
+            self._fmt_done, self._fmt_bytes = set(), {}
             self._part_count = m.group(2).count("+") + 1
             self._part_index = 0
             self._part_frac = 0.0
@@ -729,7 +1139,8 @@ class DownloadJob:
         if m:
             self._touched.add(m.group(1).strip())
             return
-        m = re.match(r'^\[Merger\] Merging formats into "(.+)"$', line)
+        m = re.match(r'^\[(?:Merger\] Merging formats into|Metadata\] Adding metadata to'
+                     r'|EmbedThumbnail\] ffmpeg: Adding thumbnail to) "(.+)"$', line)
         if m:
             self._touched.add(m.group(1))
         pm = _PP_LINE_RE.match(line)
@@ -748,6 +1159,7 @@ class DownloadJob:
         if pl_index not in ("NA", "", "None") and n_entries not in ("NA", "", "None"):
             self._item = f"{pl_index}/{n_entries}"
         self.state = "downloading"
+        fid = parts[12] if len(parts) > 12 else ""
 
         def num(s: str) -> float | None:
             try:
@@ -756,6 +1168,11 @@ class DownloadJob:
                 return None
 
         d, t_exact, t_est = num(done), num(total), num(total_est)
+        if fid and fid != "NA":
+            if status == "finished":
+                self._fmt_done.add(fid)
+            elif d:
+                self._fmt_bytes[fid] = d
         fi, fn = num(frag_i), num(frag_n)
         frac: float | None = None
         if status == "finished":
@@ -797,15 +1214,166 @@ class DownloadJob:
                    percent=f"{overall * 100:.1f}%" if overall is not None else "",
                    speed=speed_s, eta=eta_s)
 
-    def _find_outputs(self) -> list[str]:
-        """Fallback when printed paths don't match disk (encoding quirks): search by video id."""
-        exts = {"mp4": (".mp4", ".mkv", ".webm"), "mp3": (".mp3",), "m4a": (".m4a",)}[self.options.kind]
-        found: list[str] = []
-        for vid in self._video_ids:
-            pattern = os.path.join(glob.escape(self.options.out_dir), "**", f"*[[]{glob.escape(vid)}[]]*")
-            found += [p for p in glob.glob(pattern, recursive=True) if p.lower().endswith(exts)
-                      and not re.search(r"\.f\d+[\w-]*\.\w+$", p)]
-        return sorted(set(found), key=os.path.getmtime)
+    # ------------------------------------------------------------ result verification
+    def _final_exts(self) -> tuple[str, ...]:
+        return {"mp4": (".mp4", ".mkv", ".webm"), "mp3": (".mp3",), "m4a": (".m4a",)}[
+            self.options.kind if self.options.kind in KINDS else "mp4"]
+
+    def _collect_outputs(self) -> list[tuple[str, str, bool]]:
+        """Final files of this run as ``(path, video id, strict)``.
+
+        ``strict`` marks a file rescued from the scratch folder (yt-dlp failed after producing it):
+        it is only accepted after a full check (streams and duration).
+        """
+        out: list[tuple[str, str, bool]] = []
+        seen_ids: set[str] = set()
+        seen_paths: set[str] = set()
+
+        def add(path: str, vid: str, strict: bool) -> None:
+            key = os.path.normcase(os.path.abspath(path))
+            if key not in seen_paths:
+                seen_paths.add(key)
+                out.append((path, vid, strict))
+                if vid:
+                    seen_ids.add(vid)
+
+        for vid, path in self._printed:
+            if os.path.isfile(path):
+                add(path, vid, False)
+                continue
+            # Printed path doesn't match disk (encoding quirk / renamed meanwhile): look it up by
+            # id *and* requested quality label, so a different quality is never reported.
+            for p in self._search(self.options.out_dir, vid):
+                add(p, vid, False)
+        for vid in list(self._items):
+            if vid in seen_ids or not self.temp_dir:
+                continue
+            for p in self._search(self.temp_dir, vid):
+                add(p, vid, True)
+        return out
+
+    def _search(self, folder: str, vid: str) -> list[str]:
+        if not vid or not folder or not os.path.isdir(folder):
+            return []
+        label = requested_label(self.options)
+        pattern = os.path.join(glob.escape(folder), "**",
+                               f"*[[]{glob.escape(vid)}[]] - {glob.escape(label)}.*")
+        tmp = os.path.normcase(os.path.abspath(self.temp_dir)) if self.temp_dir else None
+        found = []
+        for p in glob.glob(pattern, recursive=True):
+            if not p.lower().endswith(self._final_exts()) or _INTERMEDIATE_RE.search(p):
+                continue
+            if tmp and folder != self.temp_dir and os.path.normcase(os.path.abspath(p)).startswith(tmp):
+                continue
+            found.append(p)
+        return sorted(found, key=os.path.getmtime)
+
+    def _validate(self, path: str, vid: str, strict: bool) -> str | None:
+        """Check a finished file; return its quality label, or None if it's missing/broken.
+
+        Rules: non-empty; MP4 has a (non-cover) video stream (or audio, if the source itself is
+        audio-only); MP3/M4A have an audio stream. ``strict`` also requires audio in MP4s and a
+        duration of at least 90 % of the source's (catches truncated/half-converted files).
+        """
+        try:
+            if os.path.getsize(path) <= 0:
+                return None
+        except OSError:
+            return None
+        req = requested_label(self.options)
+        media = _probe_media(path, self.deps)
+        if media is None:  # ffprobe unavailable: trust yt-dlp
+            return req
+        streams = media["streams"]
+        video = [s for s in streams if s["type"] == "video" and not s["attached_pic"]]
+        audio = [s for s in streams if s["type"] == "audio"]
+        info = self._items.get(vid) or {}
+        kind = self.options.kind if self.options.kind in KINDS else "mp4"
+        if kind == "mp4":
+            source_audio_only = info.get("vcodec") == "none"
+            if not video and not (audio and source_audio_only):
+                return None
+            if strict and video and not audio and info.get("acodec") not in ("none", None):
+                return None  # the source has sound, this file doesn't
+        elif not audio:
+            return None
+        expected = info.get("duration")
+        actual = media["duration"]
+        if strict and expected and actual is not None and actual < expected * 0.9 - 2:
+            return None
+
+        if kind == "mp4":
+            dims = [int(x) for x in (video[0]["width"], video[0]["height"]) if isinstance(x, int) and x > 0] \
+                if video else []
+            return f"{min(dims)}p" if dims else req
+        if kind == "mp3":
+            return req
+        return _kbps_label(audio[0].get("bit_rate")) or "m4a"
+
+    def _move_to_output(self, path: str, vid: str) -> tuple[str, bool] | None:
+        """Move a rescued file from the scratch folder to the same relative place in out_dir."""
+        assert self.temp_dir is not None
+        rel = os.path.relpath(path, self.temp_dir)
+        dest = os.path.join(self.options.out_dir, rel)
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+        except OSError:
+            return None
+        return self._place(path, dest, vid)
+
+    def _place(self, src: str, dest: str, vid: str) -> tuple[str, bool] | None:
+        """Move ``src`` to ``dest`` without ever replacing another job's (or a good existing) file.
+
+        Identical quality means an identical file: if ``dest`` already exists and is valid, or
+        another running job produced it, ``src`` is dropped and ``dest`` is reused. Returns
+        ``(path, reused_existing)``, or None if the move failed.
+        """
+        key = os.path.normcase(os.path.abspath(dest))
+        with _OUTPUT_LOCK:
+            if os.path.isfile(dest) and not _same_path(src, dest):
+                owner = _CLAIMS.get(key)
+                if (owner is not None and owner != self.id) or \
+                        self._validate(dest, vid, strict=True) is not None:
+                    _remove_file(src)
+                    return dest, True
+            for _ in range(20):
+                try:
+                    os.replace(src, dest)
+                    _CLAIMS[key] = self.id
+                    return dest, False
+                except PermissionError:  # target open in a player / scanned by antivirus
+                    time.sleep(0.3)
+                except OSError:
+                    break
+        return None
+
+    def _relabel(self, path: str, label: str, vid: str = "") -> tuple[str, bool]:
+        """Rename ``… - <requested>.<ext>`` to ``… - <delivered>.<ext>`` (e.g. best -> 2160p).
+
+        Returns ``(final path, reused_existing)``.
+        """
+        req = requested_label(self.options)
+        root, ext = os.path.splitext(path)
+        tail = f" - {req}"
+        if label != req and root.endswith(tail):
+            placed = self._place(path, root[: -len(tail)] + f" - {label}{ext}", vid)
+            if placed is not None:
+                return placed
+        _claim(path, self.id)
+        return path, False
+
+    @staticmethod
+    def _summarize_labels(labels: list[str]) -> str | None:
+        if not labels:
+            return None
+        if len(set(labels)) == 1:
+            return labels[0]
+
+        def rank(label: str) -> int:
+            m = re.match(r"^(\d+)", label)
+            return int(m.group(1)) if m else -1
+
+        return max(labels, key=rank)
 
     # ------------------------------------------------------------ post-checks
     def _ensure_mp4_compat(self, path: str, index: int, total: int) -> None:
@@ -814,7 +1382,8 @@ class DownloadJob:
         * audio that isn't AAC/MP3/ALAC (e.g. Opus) is re-encoded to AAC (video is copied);
         * HEVC/H.265 video (needs a paid codec extension on many PCs; common on TikTok) is
           re-encoded to H.264 at the same resolution.
-        Resolution is never changed. Failures leave the original file untouched.
+        Resolution is never changed. The conversion is written to the job's scratch folder and
+        only replaces the original after ffmpeg succeeded; failures leave the original untouched.
         """
         if not path.lower().endswith(".mp4") or not self.deps.ffprobe_path.is_file():
             return
@@ -831,7 +1400,10 @@ class DownloadJob:
         what = "video to H.264" if fix_video else "audio to AAC"
         label = f"Converting {what} for compatibility{suffix}..."
         self._emit(None, "processing", label)
-        tmp = path[:-4] + ".compat-tmp.mp4"
+        if self.temp_dir and os.path.isdir(self.temp_dir):
+            tmp = os.path.join(self.temp_dir, f"compat-{index}.mp4")
+        else:
+            tmp = path[:-4] + ".compat-tmp.mp4"
         self._touched.add(tmp)
         args = [str(self.deps.ffmpeg_path), "-hide_banner", "-loglevel", "error", "-nostats",
                 "-progress", "pipe:1", "-y", "-i", path, "-map", "0:V"]
@@ -867,57 +1439,79 @@ class DownloadJob:
             proc.wait()
             t.join(5)
             if proc.returncode == 0 and os.path.getsize(tmp) > 0 and not self._cancelled.is_set():
-                os.replace(tmp, path)
+                for _ in range(10):
+                    try:
+                        os.replace(tmp, path)
+                        break
+                    except PermissionError:
+                        time.sleep(0.3)
             elif not self._cancelled.is_set():
                 self._tail.append("".join(err_chunks)[-300:])
         except OSError:
             pass
         finally:
             if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+                _remove_file(tmp)
 
-    # ------------------------------------------------------------ cleanup
-    def _cleanup_partials(self) -> None:
-        """Remove .part/.ytdl/intermediate files that belong to this job."""
-        candidates: set[str] = set()
-        final = set(self.output_paths)
-        for path in self._touched:
-            for suffix in (".part", ".ytdl", ".temp", ""):
-                candidates.add(path + suffix)
-            candidates.update(glob.glob(glob.escape(path) + ".part-Frag*"))
-            candidates.update(glob.glob(glob.escape(path) + ".part*"))
-            root, ext = os.path.splitext(path)
-            candidates.add(f"{root}.temp{ext}")
-            if ext.lower() in (".webp", ".jpg", ".jpeg", ".png"):  # thumbnail (may be converted)
-                candidates.update(f"{root}{e}" for e in (".webp", ".jpg", ".jpeg", ".png"))
-        out_dir = self.options.out_dir
-        if out_dir and os.path.isdir(out_dir):
-            for vid in self._video_ids:
-                pattern = os.path.join(glob.escape(out_dir), "**", f"*[[]{glob.escape(vid)}[]]*")
-                for p in glob.glob(pattern, recursive=True):
-                    if re.search(r"\.(part|ytdl|jpg|jpeg|png|webp)$|\.part-Frag\d+|\.f\d+[\w-]*\.\w+$"
-                                 r"|\.temp\.\w+$", p, re.I):
-                        candidates.add(p)
-        for p in candidates:
-            if p in final and not p.endswith((".part", ".ytdl")):
-                continue  # keep fully finished playlist items
-            is_partial = bool(re.search(r"\.(part|ytdl|temp)$|\.part-Frag\d+|\.temp\.\w+$|\.compat-tmp\.mp4$", p))
-            is_intermediate = bool(re.search(r"\.f\d+[\w-]*\.\w+$", p)) or \
-                p.lower().endswith((".webp", ".jpg", ".png")) or p in self._touched
-            if not (is_partial or is_intermediate):
+    # ------------------------------------------------------------ scratch folder / cleanup
+    def _make_temp_dir(self, out_dir: str) -> str | None:
+        root = os.path.join(out_dir, TEMP_DIR_NAME)
+        try:
+            os.makedirs(root, exist_ok=True)
+            _hide_dir(root)
+            self._clean_stale_temp(root)
+            path = os.path.join(root, self.id)
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError:
+            return None  # fall back to downloading straight into out_dir
+
+    @staticmethod
+    def _clean_stale_temp(root: str) -> None:
+        """Remove scratch folders left behind by a crashed app (untouched for days)."""
+        now = time.time()
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+                newest = entry.stat().st_mtime
+                for dirpath, _dirs, files in os.walk(entry.path):
+                    for f in files:
+                        newest = max(newest, os.path.getmtime(os.path.join(dirpath, f)))
+                if now - newest > _STALE_TEMP_SECONDS:
+                    shutil.rmtree(entry.path, ignore_errors=True)
+            except OSError:
                 continue
-            for _ in range(10):  # the killed process may still hold a handle for a moment
-                try:
-                    if os.path.isfile(p):
-                        os.remove(p)
-                    break
-                except PermissionError:
-                    time.sleep(0.3)
-                except OSError:
-                    break
+
+    def _cleanup_partials(self) -> None:
+        """Remove this job's scratch folder and any partial files it left next to the output."""
+        if self.temp_dir:
+            _remove_tree(self.temp_dir)
+            try:
+                os.rmdir(os.path.dirname(self.temp_dir))  # only succeeds when no other job uses it
+            except OSError:
+                pass
+        tmp = os.path.normcase(os.path.abspath(self.temp_dir)) + os.sep if self.temp_dir else None
+        final = {os.path.normcase(os.path.abspath(p)) for p in self.output_paths}
+        candidates: set[str] = set()
+        for path in self._touched:
+            if tmp and os.path.normcase(os.path.abspath(path)).startswith(tmp):
+                continue  # already gone with the scratch folder
+            root, ext = os.path.splitext(path)
+            candidates.update({path + ".part", path + ".ytdl", f"{root}.temp{ext}"})
+            candidates.update(glob.glob(glob.escape(path) + ".part*"))
+            if _INTERMEDIATE_RE.search(path):
+                candidates.add(path)
+            if not self.temp_dir and self._cancelled.is_set() and \
+                    ext.lower() in (".webp", ".jpg", ".jpeg", ".png"):
+                candidates.update(f"{root}{e}" for e in (".webp", ".jpg", ".jpeg", ".png"))
+        for p in candidates:
+            if os.path.normcase(os.path.abspath(p)) not in final:
+                _remove_file(p)
 
 
 def _fmt_bytes(n: float | None) -> str:

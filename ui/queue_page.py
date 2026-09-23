@@ -1,8 +1,10 @@
 """Queue page: job rows plus the scheduler that runs at most ``MAX_CONCURRENT`` downloads."""
 from __future__ import annotations
 
+import copy
 import logging
 import os
+import re
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -10,8 +12,10 @@ import customtkinter as ctk
 
 from ui import theme as T
 from ui.backend import DownloadJob, JobOptions
-from ui.util import (BITRATE_LABELS, friendly_error, open_folder,
-                     quality_label, show_in_explorer, truncate)
+from ui.util import (BITRATE_LABELS, delivered_quality_text, friendly_error, media_key, middle_ellipsis,
+                     open_folder,
+                     quality_shortfall, requested_quality_text, short_quality,
+                     show_in_explorer, truncate)
 from ui.widgets import Card, Chip, PageHeader, ScrollArea, fit_text
 
 if TYPE_CHECKING:
@@ -37,15 +41,54 @@ _STATE_STYLE: dict[str, tuple[str, str]] = {
 
 
 def describe_options(opts: JobOptions) -> str:
-    kind = opts.kind.upper()
-    if opts.kind == "mp4":
-        q = "Best quality" if opts.quality == "best" else quality_label(opts.quality)
-        text = f"{kind} · {q}"
-    elif opts.kind == "mp3":
-        text = f"{kind} · {BITRATE_LABELS.get(opts.mp3_bitrate, opts.mp3_bitrate)}"
-    else:
-        text = f"{kind} · Best quality"
+    """Requested-quality chip text, e.g. "MP4 · 720p" or "MP3 · 320 kbps · Playlist"."""
+    text = requested_quality_text(opts.kind, opts.quality, opts.mp3_bitrate)
     return text + (" · Playlist" if opts.playlist else "")
+
+
+def job_signature(url: str, opts: JobOptions) -> tuple[str, str, str, bool]:
+    """Identity of a download for duplicate detection: same media + same output format.
+
+    Only the option that matters for the kind is compared, so two MP4 jobs of one video at
+    720p and 1080p are different, while re-queueing the identical request is a duplicate.
+    """
+    if opts.kind == "mp4":
+        variant = str(opts.quality or "best")
+    elif opts.kind == "mp3":
+        variant = str(opts.mp3_bitrate)
+    else:
+        variant = "best"
+    return media_key(url), opts.kind, variant, bool(opts.playlist)
+
+
+class DuplicateJobError(Exception):
+    """The identical download is already waiting or running."""
+
+    def __init__(self, row: "JobRow") -> None:
+        super().__init__("Already in the queue")
+        self.row = row
+
+
+#: ``job.error_kind`` values that are fixed by signing in (cookies from a browser, Settings).
+LOGIN_ERROR_KINDS = frozenset({"login_required", "cookies_required", "age_restricted",
+                               "members_only", "private", "private_video", "sign_in"})
+_COLLAPSE_LINES = 4
+_COLLAPSE_CHARS = 360
+
+
+def _collapse_message(text: str) -> str | None:
+    """Short preview of a long message, or None when it's short enough to show in full."""
+    lines = text.splitlines()
+    if len(lines) <= _COLLAPSE_LINES and len(text) <= _COLLAPSE_CHARS:
+        return None
+    head = "\n".join(lines[:3])
+    if len(head) > 240:
+        head = head[:240].rsplit(" ", 1)[0]
+    return head.rstrip(" .,;:") + "…"
+
+
+def _looks_like_path(text: str) -> bool:
+    return bool(text) and (os.path.isabs(text) or os.path.exists(text))
 
 
 class JobRow(Card):
@@ -62,6 +105,16 @@ class JobRow(Card):
         self._indeterminate = False
         self._state_applied = False
         self._fit_job: str | None = None
+        self._finished_job: str | None = None  # job id whose on_done was already applied
+        self._message_color: Any = None
+        self._detail_file: str | None = None  # finished file name, fitted with a middle "…"
+        self._msg_full = ""
+        self._msg_collapsed: str | None = None
+        self._msg_expanded = False
+        self._try_quality: str | None = None
+        self._want_settings = False
+        self._actions: ctk.CTkFrame | None = None  # built lazily (only failed/noted rows)
+        self._action_widgets: dict[str, ctk.CTkButton] = {}
 
         self.grid_columnconfigure(1, weight=1)
         box = ctk.CTkFrame(self, width=44, height=44, corner_radius=10, fg_color=T.ACCENT_SOFT)
@@ -85,18 +138,23 @@ class JobRow(Card):
 
         meta = ctk.CTkFrame(self, fg_color="transparent")
         meta.grid(row=1, column=1, sticky="ew", pady=(3, 0))
-        meta.grid_columnconfigure(1, weight=1)
-        self.opts_label = T.label(meta, describe_options(job.options), 12, color=T.TEXT_2)
-        self.opts_label.grid(row=0, column=0, sticky="w")
+        meta.grid_columnconfigure(2, weight=1)
+        self._meta = meta
+        self.opts_chip = Chip(meta, describe_options(job.options), "neutral")
+        self.opts_chip.grid(row=0, column=0, sticky="w")
+        self.saved_chip = Chip(meta, "", "success")  # gridded once the job is done
         self.detail = T.label(meta, "Waiting for a free slot…", 12, color=T.TEXT_3,
                               anchor="e", justify="right")
-        self.detail.grid(row=0, column=1, sticky="e", padx=(10, 0))
+        self.detail.grid(row=0, column=2, sticky="e", padx=(10, 0))
 
         self.bar = T.progress_bar(self, mode="determinate")
         self.bar.set(0)
         self.bar.grid(row=2, column=1, sticky="ew", pady=(10, 16))
 
-        self.error_label = T.label(self, "", 12, color=T.DANGER, wraplength=560)
+        # Failure reason (danger) or a note on a successful download (warning / secondary).
+        # Multi-line: the engine's friendly messages are 2-4 lines and are shown in full.
+        self.message_label = T.label(self, "", 12, color=T.DANGER, wraplength=560,
+                                     justify="left")
 
         self.buttons = ctk.CTkFrame(self, fg_color="transparent")
         self.buttons.grid(row=0, column=2, rowspan=3, padx=(14, 14), sticky="e")
@@ -111,8 +169,8 @@ class JobRow(Card):
     def _on_resize(self, event: Any) -> None:
         scaling = self._get_widget_scaling() or 1.0
         wrap = max(200, int(event.width / scaling) - 260)
-        if wrap != self.error_label.cget("wraplength"):
-            self.error_label.configure(wraplength=wrap)
+        if wrap != self.message_label.cget("wraplength"):
+            self.message_label.configure(wraplength=wrap)
 
     def _schedule_fit(self) -> None:
         """Debounced title fitting (resizes fire many <Configure> events)."""
@@ -132,6 +190,23 @@ class JobRow(Card):
         text = fit_text(self._title_text, T.font(13, "semibold"), max(60, int(avail)))
         if text != self.title.cget("text"):
             self.title.configure(text=text)
+        self._fit_detail()
+
+    def _fit_detail(self) -> None:
+        """Fit the saved file name beside the chips, keeping its end (" - 720p.mp4") visible."""
+        name = self._detail_file
+        if not name:
+            return
+        width = self._meta.winfo_width()
+        if width <= 1:
+            self._set_detail(truncate(name, 60))
+            return
+        scaling = self._get_widget_scaling() or 1.0
+        used = self.opts_chip.winfo_reqwidth()
+        if self.saved_chip.winfo_manager():
+            used += self.saved_chip.winfo_reqwidth()
+        avail = (width - used) / scaling - 30
+        self._set_detail(middle_ellipsis(name, T.font(12).measure, max(60, int(avail))))
 
     def _button(self, name: str) -> ctk.CTkButton:
         btn = self._btns.get(name)
@@ -176,6 +251,8 @@ class JobRow(Card):
             return
         self._state_applied = True
         self.state = state
+        if state != "done":
+            self._detail_file = None
         text, style = _STATE_STYLE.get(state, (state.title(), "neutral"))
         self.state_chip.set(text, style)
         if detail is not None:
@@ -195,8 +272,9 @@ class JobRow(Card):
             self.bar.configure(progress_color=T.TRACK)
         else:
             self.bar.configure(progress_color=T.ACCENT)
-        if state != "error":
-            self.error_label.grid_forget()
+        if state not in FINISHED:
+            self._hide_message()
+            self.saved_chip.grid_forget()
         self._layout_buttons()
         self._schedule_fit()
 
@@ -213,7 +291,10 @@ class JobRow(Card):
             self.bar.set(self._last_fraction or 0)
 
     def apply_progress(self, d: dict) -> None:
-        if self.state in FINISHED or self.state == "cancelling":
+        # A late update (after on_done, or from a job replaced by Retry) must never flip a
+        # finished row back to "downloading".
+        if (self.state in FINISHED or self.state == "cancelling"
+                or self._finished_job == self.job.id):
             return
         title = getattr(self.job, "title", None)
         if title and title != self._title_text:
@@ -252,26 +333,190 @@ class JobRow(Card):
         if text != self.detail.cget("text"):
             self.detail.configure(text=text)
 
+    # ------------------------------------------------------------------ message + actions
+    def _show_message(self, text: str, color: Any, *, try_quality: str | None = None,
+                      settings: bool = False) -> None:
+        """Show the failure reason / success note under the bar, with optional actions.
+
+        Long messages are collapsed to a few lines with a "Show more" toggle; short ones
+        (the usual 2-4 line friendly message) are shown in full, wrapped.
+        """
+        self._msg_full = text
+        self._msg_collapsed = _collapse_message(text)
+        self._msg_expanded = False
+        self._try_quality = try_quality
+        self._want_settings = settings
+        if color is not self._message_color:
+            self._message_color = color
+            self.message_label.configure(text_color=color)
+        self._render_message()
+
+    def _render_message(self) -> None:
+        collapsed = self._msg_collapsed
+        text = self._msg_full if (self._msg_expanded or collapsed is None) else collapsed
+        if text != self.message_label.cget("text"):
+            self.message_label.configure(text=text)
+        has_actions = bool(self._try_quality or self._want_settings or collapsed is not None)
+        self.message_label.grid(row=3, column=1, columnspan=2, sticky="w",
+                                pady=(0, 6 if has_actions else 14), padx=(0, 14))
+        self.bar.grid_configure(pady=(10, 8))
+        if has_actions:
+            self._layout_actions(collapsed is not None)
+        elif self._actions is not None:
+            self._actions.grid_forget()
+
+    def _layout_actions(self, toggle: bool) -> None:
+        if self._actions is None:
+            self._actions = ctk.CTkFrame(self, fg_color="transparent")
+        frame = self._actions
+        wanted: list[str] = []
+        if self._try_quality:
+            wanted.append("try")
+        if self._want_settings:
+            wanted.append("settings")
+        if toggle:
+            wanted.append("more")
+        for name, widget in self._action_widgets.items():
+            if name not in wanted:
+                widget.grid_forget()
+        for i, name in enumerate(wanted):
+            widget = self._action_widgets.get(name)
+            if widget is None:
+                widget = {
+                    "try": lambda: T.accent_button(frame, "Try", self._try_suggested,
+                                                   icon=T.Icon.REFRESH, height=30, size=12),
+                    "settings": lambda: T.ghost_button(frame, "Open Settings",
+                                                       lambda: self.page.app.show_page("settings"),
+                                                       icon=T.Icon.SETTINGS, height=30),
+                    "more": lambda: T.ghost_button(frame, "Show more", self._toggle_message,
+                                                   height=30),
+                }[name]()
+                self._action_widgets[name] = widget
+            widget.grid(row=0, column=i, padx=(0 if i == 0 else 8, 0))
+        if self._try_quality:
+            label = f"Try {short_quality(self._try_quality)}"
+            if self._action_widgets["try"].cget("text") != label:
+                self._action_widgets["try"].configure(text=label)
+        if toggle:
+            label = "Show less" if self._msg_expanded else "Show more"
+            if self._action_widgets["more"].cget("text") != label:
+                self._action_widgets["more"].configure(text=label)
+        frame.grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 14))
+
+    def _toggle_message(self) -> None:
+        self._msg_expanded = not self._msg_expanded
+        self._render_message()
+
+    def _try_suggested(self) -> None:
+        if self._try_quality:
+            self.page.retry(self, quality=self._try_quality)
+
+    def _hide_message(self) -> None:
+        if self.message_label.winfo_manager():
+            self.message_label.grid_forget()
+            self.bar.grid_configure(pady=(10, 16))
+        if self._actions is not None and self._actions.winfo_manager():
+            self._actions.grid_forget()
+        self._try_quality = None
+        self._want_settings = False
+
+    def suggested_quality(self) -> str | None:
+        """A quality the engine says will work (``job.suggested_quality``), if it's new."""
+        raw = getattr(self.job, "suggested_quality", None)
+        if not raw:
+            return None
+        opts = self.job.options
+        value = str(raw).strip().lower().removesuffix("kbps").removesuffix("p").strip()
+        if opts.kind == "mp4":
+            ok = value == "best" or value.isdigit()
+            current = str(opts.quality)
+        elif opts.kind == "mp3":
+            ok = value in BITRATE_LABELS
+            current = str(opts.mp3_bitrate)
+        else:
+            return None
+        return value if ok and value != current else None
+
+    def needs_login(self) -> bool:
+        kind = str(getattr(self.job, "error_kind", "") or "").lower()
+        return kind in LOGIN_ERROR_KINDS or any(w in kind for w in ("login", "cookie", "sign"))
+
+    def delivered_note(self) -> str | None:
+        """Explanation when the saved quality differs from the requested one, else None."""
+        opts = self.job.options
+        delivered = getattr(self.job, "delivered_quality", None)
+        if not delivered or not quality_shortfall(opts.kind, opts.quality, str(delivered)):
+            return None
+        got = delivered_quality_text(str(delivered)) or str(delivered)
+        return (f"{short_quality(opts.quality)} isn't available for this video, so the highest "
+                f"available quality ({got}) was saved.")
+
     def finish(self, ok: bool, message: str) -> None:
+        """Apply the job's on_done result. Idempotent per job: a repeat call is ignored."""
+        if self._finished_job == self.job.id and self.state in FINISHED:
+            log.warning("ignoring repeated on_done for job %s (ok=%s)", self.job.id, ok)
+            return
+        self._finished_job = self.job.id
+        message = (message or "").strip()
         job_state = getattr(self.job, "state", "")
         if ok:
-            out = self.job.output_path or ""
-            name = os.path.basename(out.rstrip("/\\")) if out else ""
-            if message and message.lower().startswith("finished with errors"):
-                detail = message.split(". Saved to")[0]
-            else:
-                detail = name or "Saved to your download folder"
-            self.set_state("done", truncate(detail, 70))
+            self._finish_ok(message)
         elif self.cancel_requested or job_state == "cancelled":
             self.set_state("cancelled", "Cancelled")
+            self._hide_message()
         else:
             self.set_state("error", "")
-            self.error_label.configure(text=message or "The download failed.")
-            self.error_label.grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 14),
-                                  padx=(0, 14))
-            self.bar.grid_configure(pady=(10, 8))
-            return
-        self.bar.grid_configure(pady=(10, 16))
+            self._show_message(message or "The download failed.", T.DANGER,
+                               try_quality=self.suggested_quality(),
+                               settings=self.needs_login())
+
+    def _finish_ok(self, message: str) -> None:
+        out = self.job.output_path or ""
+        name = os.path.basename(out.rstrip("/\\")) if out else ""
+        self.set_state("done", "" if name else "Saved to your download folder")
+
+        delivered = getattr(self.job, "delivered_quality", None)
+        if delivered:
+            text = delivered_quality_text(str(delivered))
+            self.saved_chip.set(f"Saved · {text}" if text else "Saved", "success")
+            self.saved_chip.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        else:
+            self.saved_chip.grid_forget()
+        if name:
+            self._detail_file = name
+            self._fit_detail()  # refined by the debounced fit once the chips have sizes
+
+        # On success the engine's message is normally the output path. Anything else is a
+        # note (e.g. "Finished with errors: 2 of 12 item(s) failed") - never an error.
+        notes: list[str] = []
+        warn = False
+        engine_notes: list[str] = []
+        if message and message != out and not _looks_like_path(message):
+            engine_notes.append(message.split(". Saved to")[0].strip())
+        warning = str(getattr(self.job, "warning", None) or "").strip()
+        if warning and warning not in engine_notes:
+            engine_notes.append(warning)
+            warn = True
+        for text in filter(None, engine_notes):
+            notes.append(text if text.endswith((".", "!", "?")) else text + ".")
+            low = text.lower()
+            warn = warn or any(w in low for w in ("error", "fail", "warning", "skipped",
+                                                  "lower", "instead", "available"))
+        shortfall = self.delivered_note()
+        if shortfall:
+            warn = True
+            # Prefer the engine's own explanation when it already mentions the quality.
+            got = re.match(r"\d+", str(delivered or ""))
+            explained = any((got and got.group(0) in n) or "quality" in n.lower() for n in notes)
+            if not explained:
+                notes.append(shortfall)
+        if getattr(self.job, "already_downloaded", False):
+            notes.append("This file was already in your download folder, so it wasn't "
+                         "downloaded again.")
+        if notes:
+            self._show_message("  ".join(notes), T.WARNING if warn else T.TEXT_2)
+        else:
+            self._hide_message()
 
     # ------------------------------------------------------------------ actions
     def cancel(self) -> None:
@@ -284,7 +529,7 @@ class JobRow(Card):
         self.page.remove(self)
 
     def _show_file(self) -> None:
-        path = self.job.output_path
+        path = self.job.output_path  # the exact file of *this* job (e.g. "... - 720p.mp4")
         if path and os.path.exists(path):
             show_in_explorer(path)
         else:
@@ -350,8 +595,29 @@ class QueuePage(ctk.CTkFrame):
         super().destroy()
 
     # ------------------------------------------------------------------ public
+    def find_duplicate(self, url: str, options: JobOptions,
+                       exclude: JobRow | None = None) -> JobRow | None:
+        """A waiting/running row downloading the same media in the same format and quality."""
+        sig = job_signature(url, options)
+        for row in self.rows:
+            if row is exclude or not (row.state == "queued" or row.state in ACTIVE):
+                continue
+            if job_signature(row.job.url, row.job.options) == sig:
+                return row
+        return None
+
     def add(self, url: str, title: str, options: JobOptions, has_video: bool = True) -> JobRow:
+        """Queue a download. Raises :class:`DuplicateJobError` for an identical active job."""
+        dup = self.find_duplicate(url, options)
+        if dup is not None:
+            log.info("duplicate ignored: %s %s (already job %s)", url,
+                     describe_options(options), dup.job.id)
+            raise DuplicateJobError(dup)
         job = DownloadJob(url, title, options, self.app.deps)
+        log.info("queued job %s: url=%s kind=%s quality=%s mp3_bitrate=%s playlist=%s "
+                 "out_dir=%s cookies=%s", job.id, url, options.kind, options.quality,
+                 options.mp3_bitrate, options.playlist, options.out_dir,
+                 options.cookies_browser)
         row = JobRow(self.list, self, job, has_video)
         self.rows.append(row)
         self._regrid()
@@ -413,10 +679,17 @@ class QueuePage(ctk.CTkFrame):
         row = self._row_for(job_id)
         if row is None:
             return
+        repeat = row._finished_job == job_id and row.state in FINISHED
         row.finish(ok, message)
+        if repeat:
+            return
+        log.info("job %s finished: ok=%s state=%s output=%s delivered=%s message=%s", job_id, ok,
+                 row.state, row.job.output_path, getattr(row.job, "delivered_quality", None),
+                 truncate(message or "", 200))
         if row.state == "done" and self.app.current_page != "queue":
-            self.app.toast(f"Downloaded: {truncate(row.job.title, 60)}", "success", "Show file",
-                           row._show_file)
+            note = " (lower quality - see queue)" if row.delivered_note() else ""
+            self.app.toast(f"Downloaded: {truncate(row.job.title, 60)}{note}", "success",
+                           "Show file", row._show_file)
         elif row.state == "error":
             self.app.toast(f"Download failed: {truncate(message, 140)}", "error", "View queue",
                            lambda: self.app.show_page("queue"))
@@ -449,14 +722,32 @@ class QueuePage(ctk.CTkFrame):
         except Exception as exc:  # noqa: BLE001
             log.warning("cancel failed: %s", exc)
 
-    def retry(self, row: JobRow) -> None:
+    def retry(self, row: JobRow, quality: str | None = None) -> None:
+        """Run a finished row again with the same options (optionally a different quality)."""
         old = row.job
-        row.job = DownloadJob(old.url, old.title, old.options, self.app.deps)
+        if row.state not in FINISHED:
+            return
+        # A fresh copy of the *same* options: the requested quality is kept exactly, and
+        # nothing the previous run mutated (e.g. out_dir) leaks into the new job.
+        options = copy.copy(old.options)
+        if quality:
+            if options.kind == "mp4":
+                options.quality = quality
+            elif options.kind == "mp3":
+                options.mp3_bitrate = quality
+        if self.find_duplicate(old.url, options, exclude=row) is not None:
+            self.app.toast("Already in the queue", "info", "View queue",
+                           lambda: self.app.show_page("queue"))
+            return
+        row.job = DownloadJob(old.url, old.title, options, self.app.deps)
+        row.opts_chip.set(describe_options(options))
+        log.info("retry job %s -> %s: url=%s kind=%s quality=%s mp3_bitrate=%s playlist=%s",
+                 old.id, row.job.id, old.url, options.kind, options.quality,
+                 options.mp3_bitrate, options.playlist)
         row.cancel_requested = False
         row._last_fraction = 0.0
         row.bar.set(0)
-        row.bar.grid_configure(pady=(10, 16))
-        row.error_label.grid_forget()
+        row._hide_message()
         row.set_state("queued", "Waiting for a free slot…")
         self._pump()
 

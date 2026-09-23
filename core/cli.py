@@ -31,14 +31,13 @@ def _ensure_console() -> None:
 
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
     ATTACH_PARENT_PROCESS = -1
-    if not kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
-        if kernel32.AllocConsole():
-            _allocated_console = True
+    if not kernel32.AttachConsole(ATTACH_PARENT_PROCESS) and kernel32.AllocConsole():
+        _allocated_console = True
     try:
-        out: TextIO = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        out: TextIO = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)  # noqa: SIM115 - process-lifetime console
         sys.stdout = out
         sys.stderr = out
-        sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        sys.stdin = open("CONIN$", encoding="utf-8", errors="replace")  # noqa: SIM115
         if not _allocated_console:
             out.write("\n")  # parent prompt was already printed; start on a fresh line
     except OSError:
@@ -211,7 +210,15 @@ def _cmd_download(ns: argparse.Namespace) -> int:
     if tty:
         print()
     if result.get("ok"):
-        print(f"Saved: {result['message']}")
+        # Files are named "<title> [<id>] - <quality>.<ext>" (e.g. "- 720p.mp4", "- 320kbps.mp3").
+        quality = f" ({job.delivered_quality})" if job.delivered_quality else ""
+        verb = "Already downloaded" if job.already_downloaded else "Saved"
+        message = str(result.get("message") or "")
+        print(f"{verb}{quality}: {job.output_path or message}")
+        if message.lower().startswith("finished with errors"):
+            print(message.split(". Saved to")[0] + ".")
+        if job.warning:
+            print(f"Warning: {job.warning}")
         return 0
     print(f"Error: {result.get('message')}", file=sys.stderr)
     return 1

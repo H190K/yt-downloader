@@ -12,6 +12,7 @@ from PIL import Image
 
 from ui import theme as T
 from ui.backend import EngineError, JobOptions, MediaInfo, fetch_info
+from ui.queue_page import DuplicateJobError
 from ui.util import (BITRATE_LABELS, detect_platform, fetch_thumbnail, fmt_duration,
                      friendly_error, looks_like_url, normalize_url, preferred_quality,
                      pretty_extractor, quality_label, quality_options, truncate)
@@ -40,7 +41,13 @@ class DownloadPage(ctk.CTkFrame):
         self._fetch_cancel: threading.Event | None = None
         self._fetching = False
         self._thumb_image: ctk.CTkImage | None = None
-        self._quality_map: dict[str, str] = {}
+        self._quality_map: dict[str, str] = {}  # menu label -> value, for the current kind
+        self._quality_kind = ""                  # kind that _quality_map was built for
+        # Explicit user choices on this page. They win over the Settings defaults until the
+        # page is reset (after queueing / F5), so a fetch finishing, switching format tiles or
+        # changing Settings can never silently replace e.g. "720p" with "Best available".
+        self._user_kind: str | None = None
+        self._user_quality: dict[str, str] = {}  # kind -> value ("720", "320")
         self._wrap_job: str | None = None
         self._menu_values: list[str] = ["Best available"]
         self._menu_state = "normal"
@@ -159,7 +166,8 @@ class DownloadPage(ctk.CTkFrame):
 
         self.quality_title = T.label(body, "Quality", 12, "semibold", T.TEXT_2)
         self.quality_title.grid(row=0, column=2, sticky="w", pady=(0, 6), padx=(20, 0))
-        self.quality_menu = T.option_menu(body, ["Best available"], width=200)
+        self.quality_menu = T.option_menu(body, ["Best available"], width=200,
+                                          command=self._on_quality_picked)
         self.quality_menu.grid(row=1, column=2, sticky="w", padx=(20, 0))
         self.playlist_switch = T.switch(body, "Whole playlist")
 
@@ -382,28 +390,72 @@ class DownloadPage(ctk.CTkFrame):
                                  state="disabled" if busy else "normal")
 
     # ------------------------------------------------------------------ options
-    def _on_kind_changed(self, _value: str) -> None:
+    def _on_kind_changed(self, value: str) -> None:
+        """User clicked a format tile (programmatic ``tiles.set`` does not come here)."""
+        self._user_kind = value
         self._refresh_quality()
+
+    def _on_quality_picked(self, label: str) -> None:
+        """User picked an entry in the quality/bitrate dropdown."""
+        kind = self._quality_kind
+        value = self._quality_map.get(label)
+        if value is None or kind not in ("mp4", "mp3"):
+            return
+        self._user_quality[kind] = value
+        self._user_kind = kind  # choosing a quality also commits to this format
+        log.debug("quality picked: kind=%s value=%s (%s)", kind, value, label)
+
+    def _wanted_quality(self, kind: str) -> str:
+        """The user's explicit choice for ``kind`` if any, else the Settings default."""
+        if kind in self._user_quality:
+            return self._user_quality[kind]
+        if kind == "mp3":
+            return str(self.app.cfg.get("mp3_bitrate", "320"))
+        return str(self.app.cfg.get("default_quality", "best"))
 
     def _refresh_quality(self) -> None:
         kind = self.tiles.get() or "mp4"
-        cfg = self.app.cfg
+        self._quality_kind = kind
         if kind == "mp4":
             heights = self.info.heights if self.info is not None else None
             values = quality_options(heights)
             self._quality_map = {quality_label(v): v for v in values}
-            default = preferred_quality(str(cfg.get("default_quality", "best")), values)
+            # An explicit "720" stays 720 when the new list has it; if the video lacks that
+            # height the closest lower one is shown (never silently "Best").
+            chosen = preferred_quality(self._wanted_quality("mp4"), values)
             self.quality_title.configure(text="Quality")
-            self._set_menu(list(self._quality_map), quality_label(default), True)
+            self._set_menu(list(self._quality_map), quality_label(chosen), True)
         elif kind == "mp3":
             self._quality_map = {lbl: v for v, lbl in BITRATE_LABELS.items()}
             self.quality_title.configure(text="Bitrate")
+            want = self._wanted_quality("mp3")
             self._set_menu(list(self._quality_map),
-                           BITRATE_LABELS.get(str(cfg.get("mp3_bitrate", "320")), "320 kbps"), True)
+                           BITRATE_LABELS.get(want, BITRATE_LABELS["320"]), True)
         else:
             self._quality_map = {"Best available": "best"}
             self.quality_title.configure(text="Quality")
             self._set_menu(["Best available"], "Best available", False)
+
+    def selected_options(self) -> tuple[str, str, str]:
+        """``(kind, quality, mp3_bitrate)`` exactly as currently shown in the UI.
+
+        The label shown in the menu is the source of truth. If it can't be mapped (should
+        not happen) the user's explicit choice / Settings default is used and a warning is
+        logged, rather than silently downloading "best".
+        """
+        kind = self.tiles.get() or "mp4"
+        if self._quality_kind != kind:  # tiles changed without the command (defensive)
+            self._refresh_quality()
+        label = self.quality_menu.get()
+        value = self._quality_map.get(label)
+        if value is None:
+            value = self._wanted_quality(kind) if kind in ("mp4", "mp3") else "best"
+            log.warning("quality label %r not in menu for %s; using %s", label, kind, value)
+        quality = value if kind == "mp4" else "best"
+        bitrate = value if kind == "mp3" else str(self.app.cfg.get("mp3_bitrate", "320"))
+        if kind == "mp3" and bitrate not in BITRATE_LABELS:
+            bitrate = "320"
+        return kind, quality, bitrate
 
     def _set_menu(self, values: list[str], value: str, enabled: bool) -> None:
         """Reconfigure the quality menu only when something actually changed.
@@ -424,11 +476,18 @@ class DownloadPage(ctk.CTkFrame):
             self.dest_label.configure(text=text)
 
     def apply_defaults(self) -> None:
-        """Re-apply default format/quality from settings (used on reset and settings change)."""
-        if self.info is None or self.info.has_video:
-            self.tiles.set_visible(["mp4", "mp3", "m4a"])
-        kind = str(self.app.cfg.get("default_kind", "mp4"))
-        self.tiles.set(kind if kind in ("mp4", "mp3", "m4a") else "mp4")
+        """Re-apply default format/quality from settings (used on reset and settings change).
+
+        Explicit choices the user made on this page are kept; ``reset()`` clears them first.
+        """
+        visible = ["mp4", "mp3", "m4a"] if self.info is None or self.info.has_video \
+            else ["mp3", "m4a"]
+        self.tiles.set_visible(visible)
+        kind = self._user_kind or str(self.app.cfg.get("default_kind", "mp4"))
+        if kind not in visible:
+            kind = visible[0]
+        if self.tiles.get() != kind:
+            self.tiles.set(kind)
         self._refresh_quality()
         self.update_destination()
 
@@ -450,8 +509,7 @@ class DownloadPage(ctk.CTkFrame):
         if info is not None and url not in (self._info_url, info.url, info.webpage_url):
             info = None  # the user changed the link after fetching
 
-        kind = self.tiles.get() or "mp4"
-        choice = self._quality_map.get(self.quality_menu.get(), "best")
+        kind, quality, bitrate = self.selected_options()
         out_dir = str(self.app.cfg.get("download_dir") or "")
         try:
             os.makedirs(out_dir, exist_ok=True)
@@ -461,8 +519,8 @@ class DownloadPage(ctk.CTkFrame):
             return
         options = JobOptions(
             kind=kind,
-            quality=choice if kind == "mp4" else "best",
-            mp3_bitrate=choice if kind == "mp3" else str(self.app.cfg.get("mp3_bitrate", "320")),
+            quality=quality,
+            mp3_bitrate=bitrate,
             out_dir=out_dir,
             playlist=bool(info and info.is_playlist and self.playlist_switch.get()),
             cookies_browser=self.app.cfg.get("cookies_browser"),
@@ -475,8 +533,15 @@ class DownloadPage(ctk.CTkFrame):
             site = detect_platform(url)
             title = f"{site} link" if site else url
             title = f"{title} — {truncate(url, 60)}" if site else title
+        log.info("download requested: url=%s menu=%r -> %s", url, self.quality_menu.get(), options)
         try:
             self.app.queue_page.add(url, title, options, has_video=kind == "mp4")
+        except DuplicateJobError:
+            # Same link + format + quality is already waiting/running: don't start a second
+            # identical job (it would race for the same output file).
+            self.app.toast("Already in the queue", "info", "View queue",
+                           lambda: self.app.show_page("queue"))
+            return
         except Exception as exc:  # noqa: BLE001
             log.exception("could not create job")
             self.app.toast(f"Couldn't start the download: {friendly_error(exc)}", "error")
@@ -492,6 +557,8 @@ class DownloadPage(ctk.CTkFrame):
         self._fetch_token += 1
         self._set_fetching(False)
         self.info = None
+        self._user_kind = None  # a fresh start goes back to the Settings defaults
+        self._user_quality.clear()
         self._clear_thumb()
         self.url_entry.delete(0, "end")
         self._on_url_changed()

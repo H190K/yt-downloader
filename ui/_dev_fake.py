@@ -10,12 +10,28 @@ Enabled with ``H190K_FAKE_BACKEND=1``. Extra knobs for exercising UI states:
 * URL containing ``shorts``    - vertical video with non-standard heights
 * URL containing ``soundcloud``/``audio`` - audio-only media
 * URL containing ``err``       - the download fails half way
+* URL containing ``hd1080``    - source only has up to 1080p: asking for 4K saves 1080p
+  (``delivered_quality`` differs from the request; shown as a success with a note)
+* URL containing ``warn``      - success with a warning message ("Finished with errors: ...")
+* URL containing ``late``      - after on_done(ok) a stray progress update and a second,
+  failing on_done arrive (the finished row must stay "Completed")
+* URL containing ``why``       - like ``hd1080`` but the engine explains the lower quality in
+  ``job.warning`` (the row shows that text, in the warning color)
+* URL containing ``403``       - fails with ``error_kind="http_403"``, a multi-line friendly
+  message and ``suggested_quality="1080"``; the retry at <= 1080p succeeds ("Try 1080p")
+* URL containing ``login``     - fails with ``error_kind="login_required"`` ("Open Settings")
+* URL containing ``long``      - fails with a very long message (collapsed, "Show more")
+
+Finished jobs mimic the real engine: ``output_path`` is ``<title> [<id>] - 720p.mp4`` /
+``- 320kbps.mp3`` / ``- 128kbps.m4a`` and ``delivered_quality`` is set ("720p", "320kbps").
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -152,6 +168,25 @@ class MediaInfo:
     has_video: bool = True
 
 
+_FULL_LADDER = [2160, 1440, 1080, 720, 480, 360, 240]
+
+
+def _fake_heights(url: str) -> list[int]:
+    """Video heights the simulated source offers (shared by fetch_info and DownloadJob)."""
+    low = url.lower()
+    if "soundcloud" in low or "audio" in low:
+        return []
+    if "shorts" in low:
+        return [1920, 1280, 854, 640]
+    if "hd1080" in low or "list" in low:
+        return [1080, 720, 480, 360]
+    return list(_FULL_LADDER)
+
+
+def _fake_id(url: str) -> str:
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:11]
+
+
 def fetch_info(url: str, deps: DependencyManager, cookies_browser: str | None = None,
                cancel_event: threading.Event | None = None) -> MediaInfo:
     for _ in range(12):
@@ -170,15 +205,15 @@ def fetch_info(url: str, deps: DependencyManager, cookies_browser: str | None = 
     if "shorts" in low:
         return MediaInfo(url, "Crazy skateboard trick #shorts", "SkateDaily", 31.0,
                          "https://picsum.photos/seed/h190k4/360/640", "youtube", url, False, 1,
-                         [1920, 1280, 854, 640], True)
+                         _fake_heights(url), True)
     if "list" in low:
         return MediaInfo(url, "Python for Beginners - Complete Course Playlist", "Code Academy",
                          None, "https://picsum.photos/seed/h190k3/640/360", "youtube:tab", url,
-                         True, 12, [1080, 720, 480, 360], True)
+                         True, 12, _fake_heights(url), True)
     return MediaInfo(url, "Exploring the Swiss Alps in 4K - A Cinematic Journey Through Mountains, "
                           "Lakes and Tiny Villages", "Wanderlust Films", 1234.0,
                      "https://picsum.photos/seed/h190k/640/360", "youtube", url, False, 1,
-                     [2160, 1440, 1080, 720, 480, 360, 240], True)
+                     _fake_heights(url), True)
 
 
 @dataclass
@@ -202,6 +237,12 @@ class DownloadJob:
         self.deps = deps
         self.state = "queued"
         self.output_path: str | None = None
+        self.delivered_quality: str | None = None
+        self.warning: str | None = None
+        self.already_downloaded = False
+        self.error: str | None = None
+        self.error_kind: str | None = None
+        self.suggested_quality: str | None = None
         self._cancel = threading.Event()
 
     def start(self, on_progress: Callable[["DownloadJob", dict], None],
@@ -218,10 +259,11 @@ class DownloadJob:
                     self.state = "cancelled"
                     on_done(self, False, "Cancelled")
                     return
-                if "err" in self.url.lower() and i == steps // 2:
+                failure = self._failure() if i == steps // 2 else None
+                if failure is not None:
                     self.state = "error"
-                    on_done(self, False, "HTTP Error 403: Forbidden. The site blocked the download - "
-                                         "try again later or update yt-dlp.")
+                    self.error = failure
+                    on_done(self, False, failure)
                     return
                 frac = i / steps
                 on_progress(self, {
@@ -233,9 +275,75 @@ class DownloadJob:
         on_progress(self, {"fraction": None, "percent": "", "speed": "", "eta": "",
                            "status": "processing", "message": "Merging video and audio", "item": ""})
         time.sleep(1.2)
+        self.delivered_quality = self._delivered()
+        self.output_path = self._output_name()
+        wanted = self.options.quality
+        if "why" in self.url.lower() and wanted.isdigit() and int(wanted) > 1080:
+            self.warning = (f"This video is only available up to 1080p, so 1080p was saved "
+                            f"instead of {self.options.quality}p.")
         self.state = "done"
-        self.output_path = str(Path(self.options.out_dir) / f"{self.title[:40]}.{self.options.kind}")
+        low = self.url.lower()
+        if "warn" in low:
+            on_done(self, True, "Finished with errors: 1 of 12 item(s) failed. "
+                                f"Saved to {self.output_path}")
+            return
         on_done(self, True, self.output_path)
+        if "late" in low:  # misbehaving backend: stray callbacks after completion
+            time.sleep(0.3)
+            on_progress(self, {"fraction": 0.5, "percent": "50.0%", "speed": "1.00MiB/s",
+                               "eta": "00:05", "status": "downloading", "message": "", "item": ""})
+            on_done(self, False, "Spurious failure after success")
+
+    def _failure(self) -> str | None:
+        """Simulated failure for this URL/options, or None (sets error_kind/suggested_quality)."""
+        low = self.url.lower()
+        if "403" in low:
+            q = self.options.quality
+            if self.options.kind == "mp4" and (not q.isdigit() or int(q) > 1080):
+                self.error_kind = "http_403"
+                self.suggested_quality = "1080"
+                return ("YouTube refused the download of the high-quality stream (HTTP 403 "
+                        "Forbidden).\nThis happens with some videos when the 4K/1440p formats "
+                        "need extra verification.\nLower qualities of this video still work - "
+                        "try 1080p, or update the tools from About & updates.")
+            return None
+        if "login" in low:
+            self.error_kind = "login_required"
+            return ("This video needs you to be signed in.\nChoose the browser you're logged "
+                    "in with under Settings > Cookies, then try again.")
+        if "long" in low:
+            self.error_kind = "unknown"
+            details = "\n".join(f"Detail line {n}: the server closed the connection while "
+                                f"sending fragment {n * 7} of 212." for n in range(1, 7))
+            return "The download failed after several attempts. " * 4 + "\n" + details
+        if "err" in low:
+            self.error_kind = "http_403"
+            return ("HTTP Error 403: Forbidden. The site blocked the download - "
+                    "try again later or update yt-dlp.")
+        return None
+
+    def _delivered(self) -> str:
+        """What the simulated source can actually provide for the requested options."""
+        kind = self.options.kind
+        if kind == "mp3":
+            return f"{self.options.mp3_bitrate}kbps"
+        if kind == "m4a":
+            return "128kbps"
+        heights = sorted(_fake_heights(self.url), reverse=True) or [720]
+        if "why" in self.url.lower():
+            heights = [1080, 720, 480, 360]
+        if self.options.quality.isdigit():
+            want = int(self.options.quality)
+            fit = [h for h in heights if h <= want]
+            return f"{fit[0] if fit else heights[-1]}p"
+        return f"{heights[0]}p"
+
+    def _output_name(self) -> str:
+        safe = re.sub(r'[<>:"/\\|?*]', "_", self.title)[:60].strip() or "video"
+        if self.options.playlist:
+            return str(Path(self.options.out_dir) / safe)
+        name = f"{safe} [{_fake_id(self.url)}] - {self.delivered_quality}.{self.options.kind}"
+        return str(Path(self.options.out_dir) / name)
 
     def cancel(self) -> None:
         self._cancel.set()
