@@ -1,0 +1,243 @@
+"""Simulated backend with the same interface as ``core`` (see CONTRACT.md).
+
+Enabled with ``H190K_FAKE_BACKEND=1``. Extra knobs for exercising UI states:
+
+* ``H190K_FAKE_READY=1``      - tools are already installed (skip the setup screen)
+* ``H190K_FAKE_FAIL_SETUP=1`` - the first install attempt fails (to test Retry)
+* URL containing ``fail``      - fetch raises an EngineError
+* URL containing ``insta``     - fetch raises the Instagram login EngineError
+* URL containing ``list``      - playlist with 12 entries
+* URL containing ``shorts``    - vertical video with non-standard heights
+* URL containing ``soundcloud``/``audio`` - audio-only media
+* URL containing ``err``       - the download fails half way
+"""
+from __future__ import annotations
+
+import json
+import os
+import random
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+from core.paths import resource_path  # noqa: F401  (stdlib-only module, safe to import)
+
+TOOLS = ("yt-dlp", "ffmpeg", "deno")
+TOOLS_DIR = Path(tempfile.gettempdir()) / "h190k_fake_tools"
+_CONFIG = Path(tempfile.gettempdir()) / "h190k_fake_config.json"
+_STATE = {"ready": os.environ.get("H190K_FAKE_READY") == "1",
+          "fail_next": os.environ.get("H190K_FAKE_FAIL_SETUP") == "1",
+          "yt-dlp": "2025.08.20"}
+
+Progress = Callable[[str, str, "float | None"], None]
+
+
+def ensure_dirs() -> None:
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------------------------------------------------------- config
+_DEFAULTS: dict[str, Any] = {
+    "download_dir": str(Path.home() / "Downloads" / "H190K Downloader"),
+    "theme": "dark", "default_kind": "mp4", "default_quality": "best", "mp3_bitrate": "320",
+    "cookies_browser": None, "auto_check_updates": True, "last_update_check": 0.0,
+}
+
+
+def load_config() -> dict[str, Any]:
+    cfg = dict(_DEFAULTS)
+    try:
+        cfg.update(json.loads(_CONFIG.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+    if os.environ.get("H190K_FAKE_THEME"):
+        cfg["theme"] = os.environ["H190K_FAKE_THEME"]
+    return cfg
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    _CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------- deps
+class DependencyError(Exception):
+    pass
+
+
+class DependencyManager:
+    def __init__(self, tools_dir: Path = TOOLS_DIR) -> None:
+        self.tools_dir = tools_dir
+        self.ytdlp_path = tools_dir / "yt-dlp.exe"
+        self.ffmpeg_dir = tools_dir
+        self.deno_path = tools_dir / "deno.exe"
+
+    def status(self) -> dict[str, dict]:
+        time.sleep(0.3)
+        ready = _STATE["ready"]
+        versions = {"yt-dlp": _STATE["yt-dlp"], "ffmpeg": "2025-09-20", "deno": "2.4.5"}
+        return {t: {"installed": ready, "version": versions[t] if ready else None,
+                    "path": str(self.tools_dir / f"{t}.exe")} for t in TOOLS}
+
+    def missing(self) -> list[str]:
+        return [] if _STATE["ready"] else list(TOOLS)
+
+    def is_ready(self) -> bool:
+        return bool(_STATE["ready"])
+
+    def install_missing(self, progress: Progress | None = None) -> None:
+        progress = progress or (lambda *a: None)
+        for tool, mb in (("yt-dlp", 18), ("ffmpeg", 95), ("deno", 42)):
+            progress(tool, "Connecting...", None)
+            time.sleep(0.6)
+            for i in range(1, 21):
+                time.sleep(0.05)
+                progress(tool, f"Downloading {mb * i / 20:.1f} / {mb} MB", i / 20)
+                if tool == "ffmpeg" and i == 12 and _STATE["fail_next"]:
+                    _STATE["fail_next"] = False
+                    raise DependencyError("Could not download FFmpeg: the connection timed out. "
+                                          "Check your internet connection and try again.")
+            if tool == "ffmpeg":
+                progress(tool, "Extracting...", None)
+                time.sleep(0.8)
+            progress(tool, "Installed", 1.0)
+        _STATE["ready"] = True
+
+    def check_updates(self) -> dict[str, dict]:
+        time.sleep(1.2)
+        return {
+            "yt-dlp": {"current": _STATE["yt-dlp"], "latest": "2025.09.05",
+                       "update_available": _STATE["yt-dlp"] != "2025.09.05"},
+            "ffmpeg": {"current": "2025-09-20", "latest": "2025-09-20", "update_available": False},
+            "deno": {"current": "2.4.5", "latest": "2.4.5", "update_available": False},
+        }
+
+    def update_all(self, progress: Progress | None = None) -> dict[str, str]:
+        progress = progress or (lambda *a: None)
+        out: dict[str, str] = {}
+        for tool in TOOLS:
+            progress(tool, "Checking...", None)
+            time.sleep(0.4)
+            if tool == "yt-dlp" and _STATE["yt-dlp"] != "2025.09.05":
+                for i in range(1, 11):
+                    time.sleep(0.08)
+                    progress(tool, "Downloading update", i / 10)
+                _STATE["yt-dlp"] = "2025.09.05"
+                out[tool] = "updated to 2025.09.05"
+            else:
+                out[tool] = "up to date"
+        return out
+
+
+# ----------------------------------------------------------------------------- engine
+class EngineError(Exception):
+    pass
+
+
+@dataclass
+class MediaInfo:
+    url: str
+    title: str
+    uploader: str | None
+    duration: float | None
+    thumbnail: str | None
+    extractor: str
+    webpage_url: str
+    is_playlist: bool
+    entry_count: int
+    heights: list[int] = field(default_factory=list)
+    has_video: bool = True
+
+
+def fetch_info(url: str, deps: DependencyManager, cookies_browser: str | None = None,
+               cancel_event: threading.Event | None = None) -> MediaInfo:
+    for _ in range(12):
+        time.sleep(0.1)
+        if cancel_event is not None and cancel_event.is_set():
+            raise EngineError("Cancelled")
+    low = url.lower()
+    if "insta" in low and not cookies_browser:
+        raise EngineError("Instagram requires login - choose a browser for cookies in Settings.")
+    if "fail" in low:
+        raise EngineError("This video is unavailable. It may be private or removed.")
+    if "soundcloud" in low or "audio" in low:
+        return MediaInfo(url, "Nightcall (Extended Mix) - Late Night Drive Sessions", "Synthwave Radio",
+                         412.0, "https://picsum.photos/seed/h190k2/640/640", "soundcloud", url,
+                         False, 1, [], False)
+    if "shorts" in low:
+        return MediaInfo(url, "Crazy skateboard trick #shorts", "SkateDaily", 31.0,
+                         "https://picsum.photos/seed/h190k4/360/640", "youtube", url, False, 1,
+                         [1920, 1280, 854, 640], True)
+    if "list" in low:
+        return MediaInfo(url, "Python for Beginners - Complete Course Playlist", "Code Academy",
+                         None, "https://picsum.photos/seed/h190k3/640/360", "youtube:tab", url,
+                         True, 12, [1080, 720, 480, 360], True)
+    return MediaInfo(url, "Exploring the Swiss Alps in 4K - A Cinematic Journey Through Mountains, "
+                          "Lakes and Tiny Villages", "Wanderlust Films", 1234.0,
+                     "https://picsum.photos/seed/h190k/640/360", "youtube", url, False, 1,
+                     [2160, 1440, 1080, 720, 480, 360, 240], True)
+
+
+@dataclass
+class JobOptions:
+    kind: str
+    quality: str
+    mp3_bitrate: str = "320"
+    out_dir: str = ""
+    playlist: bool = False
+    cookies_browser: str | None = None
+    embed_thumbnail: bool = True
+    embed_metadata: bool = True
+
+
+class DownloadJob:
+    def __init__(self, url: str, title: str, options: JobOptions, deps: DependencyManager) -> None:
+        self.id = uuid.uuid4().hex[:10]
+        self.url = url
+        self.title = title
+        self.options = options
+        self.deps = deps
+        self.state = "queued"
+        self.output_path: str | None = None
+        self._cancel = threading.Event()
+
+    def start(self, on_progress: Callable[["DownloadJob", dict], None],
+              on_done: Callable[["DownloadJob", bool, str], None]) -> None:
+        threading.Thread(target=self._run, args=(on_progress, on_done), daemon=True).start()
+
+    def _run(self, on_progress: Callable, on_done: Callable) -> None:
+        self.state = "downloading"
+        items = 12 if self.options.playlist else 1
+        steps = 40 if items == 1 else 8
+        for item in range(1, items + 1):
+            for i in range(steps + 1):
+                if self._cancel.wait(0.08 + random.random() * 0.05):
+                    self.state = "cancelled"
+                    on_done(self, False, "Cancelled")
+                    return
+                if "err" in self.url.lower() and i == steps // 2:
+                    self.state = "error"
+                    on_done(self, False, "HTTP Error 403: Forbidden. The site blocked the download - "
+                                         "try again later or update yt-dlp.")
+                    return
+                frac = i / steps
+                on_progress(self, {
+                    "fraction": frac, "percent": f"{frac * 100:.1f}%",
+                    "speed": f"{random.uniform(2, 9):.2f}MiB/s", "eta": f"00:{max(0, steps - i):02d}",
+                    "status": "downloading", "message": "", "item": f"{item}/{items}" if items > 1 else "",
+                })
+        self.state = "processing"
+        on_progress(self, {"fraction": None, "percent": "", "speed": "", "eta": "",
+                           "status": "processing", "message": "Merging video and audio", "item": ""})
+        time.sleep(1.2)
+        self.state = "done"
+        self.output_path = str(Path(self.options.out_dir) / f"{self.title[:40]}.{self.options.kind}")
+        on_done(self, True, self.output_path)
+
+    def cancel(self) -> None:
+        self._cancel.set()
+        if self.state == "queued":
+            self.state = "cancelled"

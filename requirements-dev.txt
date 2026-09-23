@@ -1,0 +1,3 @@
+# Build / development dependencies (not needed to run the app).
+-r requirements.txt
+pyinstaller>=6.10

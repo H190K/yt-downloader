@@ -1,5 +1,10 @@
-customtkinter>=5.2.0
-yt-dlp>=2023.10.13
-Pillow>=9.5.0
-requests>=2.31.0
-pyinstaller>=5.13.0
+# Runtime dependencies for H190K Downloader.
+#
+# NOTE: yt-dlp is intentionally NOT listed. The app runs the standalone
+# yt-dlp.exe (downloaded on first run into data/bin) as a subprocess so it can
+# self-update; the yt_dlp Python module is not used at runtime.
+# ffmpeg/ffprobe and deno are also downloaded by the app itself.
+# requests is no longer needed: core/ and ui/ use urllib from the stdlib.
+customtkinter>=5.2.2,<6  # UI is written against 5.2.x; 6.x not validated
+darkdetect>=0.8.0
+Pillow>=10.0.0
